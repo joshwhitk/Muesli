@@ -16,6 +16,9 @@ import json
 import time
 import datetime
 import re
+import ctypes
+import shutil
+import sys
 
 try:
     import sounddevice as sd
@@ -36,13 +39,62 @@ _READS_PER_CHUNK = int(30 * RATE / CHUNK)  # ~30s of audio per chunk
 
 os.makedirs(REC_DIR, exist_ok=True)
 
+WHISPER_QUALITY_MODELS = {
+    "fast": "medium",
+    "high": "large-v3",
+}
+_MANAGED_WHISPER_MODELS = set(WHISPER_QUALITY_MODELS.values())
+HIGH_QUALITY_MIN_FREE_GB = 20
+_CUDA_RUNTIME_PREPPED = False
+
 
 # ── Config ───────────────────────────────────────────────────────────────────
 def _load_config():
+    cfg = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
-            return json.load(f)
-    return {}
+            cfg = json.load(f)
+    return _normalize_config(cfg)
+
+
+def _free_disk_gb(path=None):
+    base = path or os.path.expanduser("~")
+    try:
+        return shutil.disk_usage(base).free / (1024 ** 3)
+    except OSError:
+        return 0.0
+
+
+def _default_whisper_quality():
+    return "high" if _free_disk_gb() >= HIGH_QUALITY_MIN_FREE_GB else "fast"
+
+
+def _infer_whisper_quality(model_name):
+    model_name = str(model_name or "").lower()
+    if model_name in ("large", "large-v2", "large-v3", "turbo"):
+        return "high"
+    return "fast"
+
+
+def _normalize_config(cfg):
+    normalized = dict(cfg or {})
+    if not normalized.get("launch_hotkey"):
+        normalized["launch_hotkey"] = "Ctrl+Shift+`"
+
+    quality = normalized.get("whisper_quality")
+    model_name = normalized.get("whisper_model")
+    if quality not in WHISPER_QUALITY_MODELS:
+        quality = _infer_whisper_quality(model_name) if model_name else _default_whisper_quality()
+    normalized["whisper_quality"] = quality
+    if not model_name or model_name in _MANAGED_WHISPER_MODELS:
+        normalized["whisper_model"] = WHISPER_QUALITY_MODELS[quality]
+
+    whisper_device = str(normalized.get("whisper_device", "auto")).lower()
+    normalized["whisper_device"] = whisper_device if whisper_device in ("auto", "cpu", "cuda") else "auto"
+
+    backend = str(normalized.get("llm_backend", "auto")).lower()
+    normalized["llm_backend"] = backend if backend in ("auto", "anthropic", "local") else "auto"
+    return normalized
 
 
 def _get_shared_dir():
@@ -51,7 +103,7 @@ def _get_shared_dir():
     default_shared = (
         local_shared
         if os.name == "nt" else
-        "/srv/al/muesli"
+        "/srv/muesli"
     )
     d = cfg.get("shared_dir", default_shared)
     try:
@@ -92,6 +144,63 @@ def _slug_from_title(title):
     return s[:60] or "recording"
 
 
+def _clean_sentence(text):
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    return text.strip(" -,:;")
+
+
+def _fallback_ai_fields(transcript):
+    text = _clean_sentence(transcript)
+    if not text:
+        return {
+            "title": "Recording",
+            "summary": "",
+            "speakers": 1,
+            "corrections": "",
+            "bugs": "",
+        }
+
+    sentences = [
+        _clean_sentence(part)
+        for part in re.split(r"(?<=[.!?])\s+", text)
+        if _clean_sentence(part)
+    ]
+    if not sentences:
+        sentences = [text]
+
+    summary = " ".join(sentences[:2]).strip()
+    if len(summary) > 320:
+        summary = summary[:317].rstrip() + "..."
+
+    stop = {
+        "the", "and", "for", "with", "that", "this", "from", "have", "just",
+        "they", "them", "then", "into", "about", "your", "there", "will",
+        "would", "could", "should", "what", "when", "where", "which",
+    }
+    words = re.findall(r"[A-Za-z0-9']+", sentences[0])
+    title_words = []
+    for word in words:
+        lower = word.lower()
+        if lower in stop:
+            continue
+        title_words.append(word.capitalize())
+        if len(title_words) == 5:
+            break
+    if not title_words:
+        title_words = [word.capitalize() for word in words[:4]] or ["Recording"]
+
+    speaker_matches = set(re.findall(r"\b(?:speaker|spk)\s*([0-9]+)\b", text, flags=re.I))
+    speakers = max(1, len(speaker_matches))
+
+    return {
+        "title": " ".join(title_words).strip() or "Recording",
+        "summary": summary,
+        "speakers": speakers,
+        "corrections": "",
+        "bugs": "",
+    }
+
+
 def _datetime_slug():
     return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -123,46 +232,138 @@ _whisper_model = None
 _whisper_lock = threading.Lock()
 
 
-def _whisper_candidates():
+def _missing_cuda_runtime(exc):
+    text = str(exc).lower()
+    return any(token in text for token in ("cublas", "cudnn", "cuda", "cufft", "curand"))
+
+
+def _iter_windows_cuda_dirs():
+    if os.name != "nt":
+        return []
+    dirs = []
+    seen = set()
+    for path in sys.path:
+        if not path:
+            continue
+        site_packages = os.path.abspath(path)
+        if not os.path.isdir(site_packages):
+            continue
+        if os.path.basename(site_packages).lower() != "site-packages":
+            continue
+        for rel in (
+            os.path.join("nvidia", "cublas", "bin"),
+            os.path.join("nvidia", "cuda_runtime", "bin"),
+            os.path.join("nvidia", "cuda_nvrtc", "bin"),
+            "ctranslate2",
+        ):
+            dll_dir = os.path.join(site_packages, rel)
+            if os.path.isdir(dll_dir) and dll_dir not in seen:
+                seen.add(dll_dir)
+                dirs.append(dll_dir)
+    return dirs
+
+
+def _prepare_windows_cuda_runtime():
+    global _CUDA_RUNTIME_PREPPED
+    if os.name != "nt" or _CUDA_RUNTIME_PREPPED:
+        return
+
+    dll_dirs = _iter_windows_cuda_dirs()
+    if dll_dirs:
+        current_path = os.environ.get("PATH", "")
+        current_parts = current_path.split(os.pathsep) if current_path else []
+        prepend = [dll_dir for dll_dir in dll_dirs if dll_dir not in current_parts]
+        if prepend:
+            os.environ["PATH"] = os.pathsep.join(prepend + [current_path]) if current_path else os.pathsep.join(prepend)
+        for dll_dir in dll_dirs:
+            try:
+                os.add_dll_directory(dll_dir)
+            except (AttributeError, FileNotFoundError, OSError):
+                pass
+
+    _CUDA_RUNTIME_PREPPED = True
+
+
+def _whisper_candidates(prefer_cpu=False):
     cfg = _load_config()
     model_name = cfg.get("whisper_model", "large-v3")
     force_device = cfg.get("whisper_device", "auto")
     candidates = []
 
-    if force_device in ("auto", "cuda"):
+    allow_cuda = not prefer_cpu and force_device in ("auto", "cuda")
+    if allow_cuda:
+        _prepare_windows_cuda_runtime()
         candidates.append((model_name, "cuda", "float16"))
-    if force_device in ("auto", "cpu"):
+    if force_device in ("auto", "cpu") or prefer_cpu:
         candidates.append((model_name, "cpu", "int8"))
-    if model_name != "medium":
-        candidates.append(("medium", "cpu", "int8"))
+    fast_model = WHISPER_QUALITY_MODELS["fast"]
+    if model_name != fast_model:
+        candidates.append((fast_model, "cpu", "int8"))
     return candidates
 
 
-def _get_whisper():
+def _load_whisper_model(prefer_cpu=False):
+    from faster_whisper import WhisperModel
+    last_error = None
+    for model_name, device, compute_type in _whisper_candidates(prefer_cpu=prefer_cpu):
+        try:
+            return WhisperModel(
+                model_name,
+                device=device,
+                compute_type=compute_type,
+            )
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"Unable to load Whisper model: {last_error}")
+
+
+def _get_whisper(prefer_cpu=False, reset=False):
     global _whisper_model
-    if _whisper_model is None:
-        with _whisper_lock:
-            if _whisper_model is None:
-                from faster_whisper import WhisperModel
-                last_error = None
-                for model_name, device, compute_type in _whisper_candidates():
-                    try:
-                        _whisper_model = WhisperModel(
-                            model_name,
-                            device=device,
-                            compute_type=compute_type,
-                        )
-                        break
-                    except Exception as exc:
-                        last_error = exc
-                if _whisper_model is None:
-                    raise RuntimeError(f"Unable to load Whisper model: {last_error}")
+    with _whisper_lock:
+        if reset:
+            _whisper_model = None
+        if _whisper_model is None:
+            _whisper_model = _load_whisper_model(prefer_cpu=prefer_cpu)
     return _whisper_model
+
+
+def _transcribe_segments(audio_file_path, **kwargs):
+    try:
+        model = _get_whisper()
+        return model.transcribe(audio_file_path, **kwargs)
+    except Exception as exc:
+        if not _missing_cuda_runtime(exc):
+            raise
+        model = _get_whisper(prefer_cpu=True, reset=True)
+        return model.transcribe(audio_file_path, **kwargs)
 
 
 # ── LLM (lazy singleton) ─────────────────────────────────────────────────────
 _llm_model = None
 _llm_lock = threading.Lock()
+_LLM_MODEL_DIR = os.path.join(APP_DIR, "models")
+
+
+def _list_gguf_models():
+    if not os.path.isdir(_LLM_MODEL_DIR):
+        return []
+    return [f for f in sorted(os.listdir(_LLM_MODEL_DIR)) if f.endswith(".gguf")]
+
+
+def _selected_gguf_model_path():
+    cfg = _load_config()
+    selected = cfg.get("llm_local_model", "")
+    models = _list_gguf_models()
+    if selected and selected in models:
+        return os.path.join(_LLM_MODEL_DIR, selected)
+    if models:
+        return os.path.join(_LLM_MODEL_DIR, models[0])
+    return None
+
+
+def _llm_backend():
+    cfg = _load_config()
+    return str(cfg.get("llm_backend", "auto")).lower()
 
 
 def _get_llm():
@@ -171,15 +372,9 @@ def _get_llm():
         with _llm_lock:
             if _llm_model is None:
                 from llama_cpp import Llama
-                model_dir = os.path.join(APP_DIR, "models")
-                model_path = None
-                if os.path.isdir(model_dir):
-                    for f in sorted(os.listdir(model_dir)):
-                        if f.endswith(".gguf"):
-                            model_path = os.path.join(model_dir, f)
-                            break
+                model_path = _selected_gguf_model_path()
                 if not model_path:
-                    raise FileNotFoundError(f"No .gguf model in {model_dir}")
+                    raise FileNotFoundError(f"No .gguf model in {_LLM_MODEL_DIR}")
                 _llm_model = Llama(
                     model_path=model_path, n_ctx=4096, n_threads=4, verbose=False
                 )
@@ -187,11 +382,14 @@ def _get_llm():
 
 
 def _llm_generate(prompt_text):
-    """Run prompt through Claude API first (fast), falling back to local LLM."""
-    # Try Claude API first — much faster than CPU inference
+    """Run prompt through the configured LLM backend."""
     cfg = _load_config()
+    backend = _llm_backend()
     api_key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-    if api_key:
+    anthropic_allowed = backend in ("auto", "anthropic")
+    local_allowed = backend in ("auto", "local")
+
+    if anthropic_allowed and api_key:
         try:
             import anthropic
             client = anthropic.Anthropic(api_key=api_key)
@@ -204,19 +402,25 @@ def _llm_generate(prompt_text):
         except Exception:
             pass
 
-    # Fallback: local LLM (slow on CPU but works offline)
-    try:
-        model = _get_llm()
-        resp = model.create_chat_completion(
-            messages=[{"role": "user", "content": prompt_text}],
-            max_tokens=512,
-            temperature=0.3,
-        )
-        return resp["choices"][0]["message"]["content"].strip()
-    except Exception:
-        pass
+    if backend == "anthropic" and not api_key:
+        raise RuntimeError("Anthropic is selected but no API key is configured")
 
-    raise RuntimeError("No LLM available (no Claude API key, local model failed)")
+    if local_allowed:
+        try:
+            model = _get_llm()
+            resp = model.create_chat_completion(
+                messages=[{"role": "user", "content": prompt_text}],
+                max_tokens=512,
+                temperature=0.3,
+            )
+            return resp["choices"][0]["message"]["content"].strip()
+        except Exception:
+            pass
+
+    if backend == "local":
+        raise RuntimeError("Local GGUF is selected but no local model is available")
+
+    raise RuntimeError("No LLM available for the configured backend")
 
 
 # ── Chunk pipeline ───────────────────────────────────────────────────────────
@@ -241,7 +445,6 @@ class _ChunkPipeline:
         self._done.wait()
 
     def _run(self):
-        whisper = _get_whisper()
         while True:
             path = self._queue.get()
             if path is None:
@@ -249,7 +452,7 @@ class _ChunkPipeline:
                 return
             # Transcribe
             try:
-                segments, _ = whisper.transcribe(path, beam_size=5)
+                segments, _ = _transcribe_segments(path, beam_size=5)
                 text = " ".join(s.text.strip() for s in segments).strip()
             except Exception:
                 text = ""
@@ -575,7 +778,7 @@ class Muesli:
             raw = re.sub(r"\n?```$", "", raw)
             ai = json.loads(raw)
         except Exception:
-            ai = {"title": "Recording", "summary": "", "speakers": 1}
+            ai = _fallback_ai_fields(transcript)
 
         title = ai.get("title", "Recording").strip() or "Recording"
         summary = ai.get("summary", "")
@@ -706,8 +909,7 @@ class Muesli:
 
     def transcribe_with_progress(self, audio_file_path, on_percent=None):
         """Transcribe with optional progress callback. on_percent(int) called with 0-100."""
-        model = _get_whisper()
-        segments, info = model.transcribe(audio_file_path, beam_size=5)
+        segments, info = _transcribe_segments(audio_file_path, beam_size=5)
         total_duration = info.duration if info.duration else 0
         collected = []
         last_pct = -1
@@ -727,13 +929,13 @@ class Muesli:
     def summarize(self, transcript):
         """Summarise a transcript string. Returns dict with title, summary, speakers, etc."""
         prompt_text = _get_summary_prompt().replace("{transcript}", transcript)
-        raw = _llm_generate(prompt_text)
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
         try:
+            raw = _llm_generate(prompt_text)
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
             return json.loads(raw)
-        except json.JSONDecodeError:
-            return {"title": "Recording", "summary": raw, "speakers": 1}
+        except Exception:
+            return _fallback_ai_fields(transcript)
 
     # ── Session access ───────────────────────────────────────────────────────
 

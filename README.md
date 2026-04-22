@@ -146,8 +146,9 @@ Common fields:
 
 ```json
 {
-  "shared_dir": "C:\\Users\\Josh\\Documents\\MuesliData\\analytics\\audio",
+  "shared_dir": "C:\\Users\\<you>\\Documents\\MuesliData\\analytics\\audio",
   "launch_hotkey": "Ctrl+Shift+`",
+  "whisper_quality": "high",
   "whisper_model": "large-v3",
   "whisper_device": "auto"
 }
@@ -157,13 +158,19 @@ Notes:
 
 - `shared_dir` controls where exported audio and sidecar files go.
 - `launch_hotkey` is used by the Windows hotkey listener.
-- `whisper_model` and `whisper_device` tune transcription quality and speed.
+- `whisper_quality` is the user-facing preset shown in Settings.
+- `whisper_model` and `whisper_device` are the underlying Whisper runtime choices.
 
 ## Models
 
 ### Whisper
 
 Whisper is provided by `faster-whisper`. The model is downloaded and cached automatically on first use.
+
+- `High Quality` uses `large-v3`
+- `Fast` uses `medium`
+- New installs default to `High Quality` when there is at least 20 GB of free disk space on the local user drive
+- On Windows with an NVIDIA GPU, `setup_windows.bat` also installs the CUDA runtime packages needed for GPU Whisper
 
 ### Local summarization model
 
@@ -234,6 +241,13 @@ outputs/                    batch outputs and sidecar mirror (not committed)
 - No formal migration path for older Granola-era paths/configs
 - Tests are still smoke-test oriented
 - The GUI still has some Windows-specific rough edges
+
+## Task List
+
+- Build a proper Windows installer
+- Add a settings panel for model and runtime configuration
+- Improve packaging so the pinned taskbar icon no longer depends on Python
+- Expand tests beyond smoke checks
 
 ## Documentation
 

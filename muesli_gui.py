@@ -2,7 +2,8 @@
 """Muesli - AI call recorder and transcriber."""
 
 import tkinter as tk
-from tkinter import simpledialog, filedialog, messagebox
+from tkinter import simpledialog, filedialog, messagebox, ttk
+import tkinter.font as tkfont
 import threading
 import queue
 import wave
@@ -16,8 +17,14 @@ import re
 import platform
 import socket
 import ctypes
+import importlib.util
+import shutil
 import pygame
-from faster_whisper import WhisperModel
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
 
 try:
     import pyaudio
@@ -55,7 +62,7 @@ TASKBAR_PIN_DIR  = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Int
 TASKBAR_SHORTCUT = os.path.join(TASKBAR_PIN_DIR, "Muesli.lnk")
 LAUNCHER_EXE     = os.path.join(APP_DIR, "dist", "Muesli.exe")
 DEFAULT_LAUNCH_HOTKEY = "Ctrl+Shift+`"
-APP_USER_MODEL_ID = "JoshStudio.Muesli"
+APP_USER_MODEL_ID = "Muesli.App"
 os.makedirs(REC_DIR, exist_ok=True)
 
 # ── Audio constants ───────────────────────────────────────────────────────────
@@ -63,17 +70,78 @@ RATE     = 16000
 CHANNELS = 1
 CHUNK    = 1024
 FORMAT   = pyaudio.paInt16 if pyaudio else None
+WHISPER_QUALITY_MODELS = {
+    "fast": "medium",
+    "high": "large-v3",
+}
+WHISPER_QUALITY_LABELS = {
+    "fast": "Fast",
+    "high": "High Quality",
+}
+_MANAGED_WHISPER_MODELS = set(WHISPER_QUALITY_MODELS.values())
+HIGH_QUALITY_MIN_FREE_GB = 20
+_CUDA_RUNTIME_PREPPED = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 def load_config():
+    cfg = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
-            return json.load(f)
-    return {}
+            cfg = json.load(f)
+    return _normalize_config(cfg)
 
 def save_config(cfg):
     with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+        json.dump(_normalize_config(cfg), f, indent=2)
+
+
+def _free_disk_gb(path=None):
+    base = path or os.path.expanduser("~")
+    try:
+        return shutil.disk_usage(base).free / (1024 ** 3)
+    except OSError:
+        return 0.0
+
+
+def _default_whisper_quality():
+    return "high" if _free_disk_gb() >= HIGH_QUALITY_MIN_FREE_GB else "fast"
+
+
+def _infer_whisper_quality(model_name):
+    model_name = str(model_name or "").lower()
+    if model_name in ("large", "large-v2", "large-v3", "turbo"):
+        return "high"
+    return "fast"
+
+
+def _normalize_config(cfg):
+    normalized = dict(cfg or {})
+    if not normalized.get("launch_hotkey"):
+        normalized["launch_hotkey"] = DEFAULT_LAUNCH_HOTKEY
+
+    quality = normalized.get("whisper_quality")
+    model_name = normalized.get("whisper_model")
+    if quality not in WHISPER_QUALITY_MODELS:
+        quality = _infer_whisper_quality(model_name) if model_name else _default_whisper_quality()
+    normalized["whisper_quality"] = quality
+    if not model_name or model_name in _MANAGED_WHISPER_MODELS:
+        normalized["whisper_model"] = WHISPER_QUALITY_MODELS[quality]
+
+    whisper_device = str(normalized.get("whisper_device", "auto")).lower()
+    normalized["whisper_device"] = whisper_device if whisper_device in ("auto", "cpu", "cuda") else "auto"
+
+    backend = str(normalized.get("llm_backend", "auto")).lower()
+    normalized["llm_backend"] = backend if backend in ("auto", "anthropic", "local") else "auto"
+    return normalized
+
+
+def _whisper_quality_summary():
+    free_gb = _free_disk_gb()
+    drive, _ = os.path.splitdrive(os.path.expanduser("~"))
+    drive_label = drive + "\\" if drive else os.path.expanduser("~")
+    quality = _default_whisper_quality()
+    label = WHISPER_QUALITY_LABELS[quality]
+    return f"Default on this PC: {label} ({free_gb:.0f} GB free on {drive_label})"
 
 
 def get_launch_hotkey():
@@ -317,12 +385,151 @@ def capture_hotkey(master, initial_value):
     master.wait_window(dialog)
     return result["value"]
 
+
+def open_settings_dialog(master):
+    cfg = load_config()
+    dialog = tk.Toplevel(master)
+    dialog.title("Settings")
+    dialog.configure(bg=DARK_BG)
+    dialog.resizable(False, False)
+    dialog.transient(master)
+    dialog.grab_set()
+
+    whisper_quality = tk.StringVar(value=cfg.get("whisper_quality", _default_whisper_quality()))
+    llm_backend = tk.StringVar(value=cfg.get("llm_backend", "auto"))
+    gguf_models = _list_gguf_models()
+    llm_local_model = tk.StringVar(value=cfg.get("llm_local_model", gguf_models[0] if gguf_models else ""))
+    saved = {"ok": False}
+
+    def _section(parent, title, subtitle):
+        frame = tk.Frame(parent, bg=PANEL_BG, bd=0, highlightthickness=1, highlightbackground=LINE)
+        frame.pack(fill="x", padx=18, pady=(0, 14))
+        tk.Label(frame, text=title, font=("Segoe UI Semibold", 10), bg=PANEL_BG, fg=FG).pack(anchor="w", padx=14, pady=(12, 2))
+        tk.Label(frame, text=subtitle, font=FONT_SM, bg=PANEL_BG, fg=FG_DIM, wraplength=430, justify="left").pack(anchor="w", padx=14, pady=(0, 10))
+        return frame
+
+    tk.Label(
+        dialog,
+        text="Settings",
+        font=("Segoe UI Semibold", 14),
+        bg=DARK_BG,
+        fg=FG,
+        padx=18,
+        pady=14,
+    ).pack(anchor="w")
+
+    whisper_frame = _section(
+        dialog,
+        "Whisper Transcription",
+        "Choose between faster transcription and the higher-quality model. New installs default to High Quality when there is enough free disk space.",
+    )
+    for value, title, detail in (
+        ("high", "High Quality", "Uses large-v3 for the best transcript quality."),
+        ("fast", "Fast", "Uses medium for quicker turnaround with lower model size."),
+    ):
+        row = tk.Frame(whisper_frame, bg=PANEL_BG)
+        row.pack(fill="x", padx=10, pady=4)
+        tk.Radiobutton(
+            row,
+            text=title,
+            value=value,
+            variable=whisper_quality,
+            bg=PANEL_BG,
+            fg=FG,
+            selectcolor=ITEM_BG,
+            activebackground=PANEL_BG,
+            activeforeground=FG,
+            font=("Segoe UI Semibold", 9),
+        ).pack(side="left")
+        tk.Label(row, text=detail, bg=PANEL_BG, fg=FG_DIM, font=FONT_SM).pack(side="left", padx=(8, 0))
+    tk.Label(whisper_frame, text=_whisper_quality_summary(), bg=PANEL_BG, fg=FG_LINK, font=FONT_SM).pack(anchor="w", padx=14, pady=(6, 12))
+
+    llm_frame = _section(
+        dialog,
+        "Summary LLM",
+        "Choose where note summaries come from. If the selected backend is unavailable, Muesli falls back to transcript-only summaries.",
+    )
+    backend_map = {
+        "Auto": "auto",
+        "Anthropic": "anthropic",
+        "Local GGUF": "local",
+    }
+    backend_labels = list(backend_map.keys())
+    backend_display = tk.StringVar(value=next((label for label, value in backend_map.items() if value == llm_backend.get()), "Auto"))
+    ttk.Combobox(
+        llm_frame,
+        textvariable=backend_display,
+        values=backend_labels,
+        state="readonly",
+        width=18,
+    ).pack(anchor="w", padx=14, pady=(0, 10))
+    if gguf_models:
+        tk.Label(llm_frame, text="Local GGUF model", bg=PANEL_BG, fg=FG_DIM, font=FONT_SM).pack(anchor="w", padx=14)
+        ttk.Combobox(
+            llm_frame,
+            textvariable=llm_local_model,
+            values=gguf_models,
+            state="readonly",
+            width=42,
+        ).pack(anchor="w", padx=14, pady=(4, 12))
+    else:
+        tk.Label(
+            llm_frame,
+            text="No local GGUF models found in models\\.",
+            bg=PANEL_BG,
+            fg=FG_DIM,
+            font=FONT_SM,
+        ).pack(anchor="w", padx=14, pady=(4, 12))
+
+    buttons = tk.Frame(dialog, bg=DARK_BG)
+    buttons.pack(fill="x", padx=18, pady=(4, 18))
+
+    def _save():
+        updated = load_config()
+        updated["whisper_quality"] = whisper_quality.get()
+        updated["whisper_model"] = WHISPER_QUALITY_MODELS[updated["whisper_quality"]]
+        updated["llm_backend"] = backend_map.get(backend_display.get(), "auto")
+        if gguf_models and llm_local_model.get() in gguf_models:
+            updated["llm_local_model"] = llm_local_model.get()
+        save_config(updated)
+        saved["ok"] = True
+        dialog.destroy()
+
+    RoundedButton(
+        buttons,
+        text="Save",
+        command=_save,
+        font=FONT_SM,
+        bg=FG_LINK,
+        fg="white",
+        active_bg="#1d4ed8",
+        shadow="#bfdbfe",
+        pad_x=14,
+        pad_y=7,
+    ).pack(side="right")
+    RoundedButton(
+        buttons,
+        text="Cancel",
+        command=dialog.destroy,
+        font=FONT_SM,
+        bg=ITEM_BG,
+        fg=FG,
+        active_bg=ITEM_ALT,
+        shadow="#d7dde7",
+        pad_x=14,
+        pad_y=7,
+    ).pack(side="right", padx=(0, 10))
+
+    dialog.focus_force()
+    master.wait_window(dialog)
+    return saved["ok"]
+
 # SHARED_DIR holds exported audio/transcript artifacts.
 _LOCAL_SHARED = os.path.join(os.path.expanduser("~"), "Documents", "MuesliData", "analytics", "audio")
 _DEFAULT_SHARED = (
     _LOCAL_SHARED
     if IS_WIN else
-    "/srv/al/muesli"
+    "/srv/muesli"
 )
 
 def get_shared_dir():
@@ -393,6 +600,63 @@ def slug_from_title(title):
     s = re.sub(r"[^a-z0-9\s\-]", "", s)
     s = re.sub(r"\s+", "-", s)
     return (s[:60] or "recording")
+
+
+def _clean_sentence(text):
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    return text.strip(" -,:;")
+
+
+def _fallback_ai_fields(transcript):
+    text = _clean_sentence(transcript)
+    if not text:
+        return {
+            "title": "Recording",
+            "summary": "",
+            "speakers": 1,
+            "corrections": "",
+            "bugs": "",
+        }
+
+    sentences = [
+        _clean_sentence(part)
+        for part in re.split(r"(?<=[.!?])\s+", text)
+        if _clean_sentence(part)
+    ]
+    if not sentences:
+        sentences = [text]
+
+    summary = " ".join(sentences[:2]).strip()
+    if len(summary) > 320:
+        summary = summary[:317].rstrip() + "..."
+
+    stop = {
+        "the", "and", "for", "with", "that", "this", "from", "have", "just",
+        "they", "them", "then", "into", "about", "your", "there", "will",
+        "would", "could", "should", "what", "when", "where", "which",
+    }
+    words = re.findall(r"[A-Za-z0-9']+", sentences[0])
+    title_words = []
+    for word in words:
+        lower = word.lower()
+        if lower in stop:
+            continue
+        title_words.append(word.capitalize())
+        if len(title_words) == 5:
+            break
+    if not title_words:
+        title_words = [word.capitalize() for word in words[:4]] or ["Recording"]
+
+    speaker_matches = set(re.findall(r"\b(?:speaker|spk)\s*([0-9]+)\b", text, flags=re.I))
+    speakers = max(1, len(speaker_matches))
+
+    return {
+        "title": " ".join(title_words).strip() or "Recording",
+        "summary": summary,
+        "speakers": speakers,
+        "corrections": "",
+        "bugs": "",
+    }
 
 def datetime_slug():
     return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -475,56 +739,173 @@ def delete_recording(meta):
 _whisper_model = None
 
 
-def _default_whisper_candidates():
+def _missing_cuda_runtime(exc):
+    text = str(exc).lower()
+    return any(token in text for token in ("cublas", "cudnn", "cuda", "cufft", "curand"))
+
+
+def _iter_windows_cuda_dirs():
+    if os.name != "nt":
+        return []
+    dirs = []
+    seen = set()
+    for path in sys.path:
+        if not path:
+            continue
+        site_packages = os.path.abspath(path)
+        if not os.path.isdir(site_packages):
+            continue
+        if os.path.basename(site_packages).lower() != "site-packages":
+            continue
+        for rel in (
+            os.path.join("nvidia", "cublas", "bin"),
+            os.path.join("nvidia", "cuda_runtime", "bin"),
+            os.path.join("nvidia", "cuda_nvrtc", "bin"),
+            "ctranslate2",
+        ):
+            dll_dir = os.path.join(site_packages, rel)
+            if os.path.isdir(dll_dir) and dll_dir not in seen:
+                seen.add(dll_dir)
+                dirs.append(dll_dir)
+    return dirs
+
+
+def _prepare_windows_cuda_runtime():
+    global _CUDA_RUNTIME_PREPPED
+    if os.name != "nt" or _CUDA_RUNTIME_PREPPED:
+        return
+
+    dll_dirs = _iter_windows_cuda_dirs()
+    if dll_dirs:
+        current_path = os.environ.get("PATH", "")
+        current_parts = current_path.split(os.pathsep) if current_path else []
+        prepend = [dll_dir for dll_dir in dll_dirs if dll_dir not in current_parts]
+        if prepend:
+            os.environ["PATH"] = os.pathsep.join(prepend + [current_path]) if current_path else os.pathsep.join(prepend)
+        for dll_dir in dll_dirs:
+            try:
+                os.add_dll_directory(dll_dir)
+            except (AttributeError, FileNotFoundError, OSError):
+                pass
+
+    _CUDA_RUNTIME_PREPPED = True
+
+
+def _default_whisper_candidates(prefer_cpu=False):
     cfg = load_config()
     model_name = cfg.get("whisper_model", "large-v3")
     force_device = cfg.get("whisper_device", "auto")
     candidates = []
 
-    if force_device in ("auto", "cuda"):
+    allow_cuda = not prefer_cpu and force_device in ("auto", "cuda")
+    if allow_cuda:
+        _prepare_windows_cuda_runtime()
         candidates.append((model_name, "cuda", "float16"))
-    if force_device in ("auto", "cpu"):
+    if force_device in ("auto", "cpu") or prefer_cpu:
         candidates.append((model_name, "cpu", "int8"))
-    if model_name != "medium":
-        candidates.append(("medium", "cpu", "int8"))
+    fast_model = WHISPER_QUALITY_MODELS["fast"]
+    if model_name != fast_model:
+        candidates.append((fast_model, "cpu", "int8"))
     return candidates
 
-def _get_whisper_model():
+
+def _load_whisper_model(prefer_cpu=False):
+    if WhisperModel is None:
+        raise RuntimeError("faster-whisper is not installed in this environment")
+    last_error = None
+    for model_name, device, compute_type in _default_whisper_candidates(prefer_cpu=prefer_cpu):
+        try:
+            return WhisperModel(
+                model_name,
+                device=device,
+                compute_type=compute_type,
+            )
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"Unable to load Whisper model: {last_error}")
+
+
+def _get_whisper_model(prefer_cpu=False, reset=False):
     global _whisper_model
+    if reset:
+        _whisper_model = None
     if _whisper_model is None:
-        last_error = None
-        for model_name, device, compute_type in _default_whisper_candidates():
-            try:
-                _whisper_model = WhisperModel(
-                    model_name,
-                    device=device,
-                    compute_type=compute_type,
-                )
-                break
-            except Exception as exc:
-                last_error = exc
-        if _whisper_model is None:
-            raise RuntimeError(f"Unable to load Whisper model: {last_error}")
+        _whisper_model = _load_whisper_model(prefer_cpu=prefer_cpu)
     return _whisper_model
+
+
+def _reset_whisper_cache():
+    global _whisper_model
+    _whisper_model = None
+
+
+def _transcribe_segments(audio_path, **kwargs):
+    try:
+        model = _get_whisper_model()
+        return model.transcribe(audio_path, **kwargs)
+    except Exception as exc:
+        if not _missing_cuda_runtime(exc):
+            raise
+        model = _get_whisper_model(prefer_cpu=True, reset=True)
+        return model.transcribe(audio_path, **kwargs)
 
 # ── Local LLM ────────────────────────────────────────────────────────────────
 _llm_model = None
 _LLM_MODEL_DIR = os.path.join(APP_DIR, "models")
 
-def _find_gguf_model():
-    """Return path to the first .gguf file in the models directory."""
+def _list_gguf_models():
     if not os.path.isdir(_LLM_MODEL_DIR):
-        return None
-    for f in sorted(os.listdir(_LLM_MODEL_DIR)):
-        if f.endswith(".gguf"):
-            return os.path.join(_LLM_MODEL_DIR, f)
+        return []
+    return [f for f in sorted(os.listdir(_LLM_MODEL_DIR)) if f.endswith(".gguf")]
+
+
+def _selected_gguf_model_path():
+    cfg = load_config()
+    selected = cfg.get("llm_local_model", "")
+    models = _list_gguf_models()
+    if selected and selected in models:
+        return os.path.join(_LLM_MODEL_DIR, selected)
+    if models:
+        return os.path.join(_LLM_MODEL_DIR, models[0])
     return None
+
+
+def _llm_backend():
+    cfg = load_config()
+    return str(cfg.get("llm_backend", "auto")).lower()
+
+
+def _llm_status_message():
+    backend = _llm_backend()
+    api_key = load_config().get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+    has_anthropic_pkg = importlib.util.find_spec("anthropic") is not None
+    has_llama_pkg = importlib.util.find_spec("llama_cpp") is not None
+    local_model_path = _selected_gguf_model_path()
+    local_ready = bool(local_model_path and has_llama_pkg)
+    anthropic_ready = bool(api_key and has_anthropic_pkg)
+
+    if backend == "anthropic":
+        if anthropic_ready:
+            return None
+        return "LLM unavailable: Anthropic is selected, but the API key or Anthropic package is missing. Summaries will use transcript-only fallback."
+    if backend == "local":
+        if local_ready:
+            return None
+        return "LLM unavailable: Local GGUF is selected, but no usable local model is configured. Summaries will use transcript-only fallback."
+    if anthropic_ready or local_ready:
+        return None
+    return "LLM unavailable: no Anthropic key and no local GGUF model detected. Summaries will use transcript-only fallback."
+
+
+def _reset_llm_cache():
+    global _llm_model
+    _llm_model = None
 
 def _get_llm_model():
     global _llm_model
     if _llm_model is None:
         from llama_cpp import Llama
-        model_path = _find_gguf_model()
+        model_path = _selected_gguf_model_path()
         if not model_path:
             raise FileNotFoundError(
                 f"No .gguf model found in {_LLM_MODEL_DIR}. "
@@ -541,11 +922,14 @@ def _get_llm_model():
     return _llm_model
 
 def _llm_generate(prompt_text):
-    """Run prompt through Claude API first (fast), falling back to local LLM."""
-    # Try Claude API first — much faster than CPU inference
+    """Run prompt through the configured LLM backend."""
     cfg = load_config()
+    backend = _llm_backend()
     api_key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-    if api_key:
+    anthropic_allowed = backend in ("auto", "anthropic")
+    local_allowed = backend in ("auto", "local")
+
+    if anthropic_allowed and api_key:
         try:
             import anthropic
             client = anthropic.Anthropic(api_key=api_key)
@@ -557,19 +941,25 @@ def _llm_generate(prompt_text):
         except Exception:
             pass
 
-    # Fallback: local LLM (slow on CPU but works offline)
-    try:
-        model = _get_llm_model()
-        resp = model.create_chat_completion(
-            messages=[{"role": "user", "content": prompt_text}],
-            max_tokens=512,
-            temperature=0.3,
-        )
-        return resp["choices"][0]["message"]["content"].strip()
-    except Exception:
-        pass
+    if backend == "anthropic" and not api_key:
+        raise RuntimeError("Anthropic is selected but no API key is configured")
 
-    raise RuntimeError("No LLM available (no Claude API key, local model failed)")
+    if local_allowed:
+        try:
+            model = _get_llm_model()
+            resp = model.create_chat_completion(
+                messages=[{"role": "user", "content": prompt_text}],
+                max_tokens=512,
+                temperature=0.3,
+            )
+            return resp["choices"][0]["message"]["content"].strip()
+        except Exception:
+            pass
+
+    if backend == "local":
+        raise RuntimeError("Local GGUF is selected but no local model is available")
+
+    raise RuntimeError("No LLM available for the configured backend")
 
 
 class ChunkPipeline:
@@ -598,7 +988,6 @@ class ChunkPipeline:
         self._done.wait()
 
     def _run(self):
-        whisper = _get_whisper_model()
         while True:
             path = self._queue.get()
             if path is None:
@@ -606,7 +995,7 @@ class ChunkPipeline:
                 return
             # 1. Transcribe
             try:
-                segments, _ = whisper.transcribe(path, beam_size=5)
+                segments, _ = _transcribe_segments(path, beam_size=5)
                 text = " ".join(s.text.strip() for s in segments).strip()
             except Exception:
                 text = ""
@@ -710,8 +1099,7 @@ def process_recording(meta, on_update, transcript=None, summaries=None):
         else:
             on_update(meta, "transcribing…")
         try:
-            model = _get_whisper_model()
-            segments, info = model.transcribe(audio_file, beam_size=5)
+            segments, info = _transcribe_segments(audio_file, beam_size=5)
             total_duration = info.duration or meta.get("duration", 0) or 1
             collected = []
             for seg in segments:
@@ -742,7 +1130,7 @@ def process_recording(meta, on_update, transcript=None, summaries=None):
         raw = re.sub(r"\n?```$",        "", raw)
         ai  = json.loads(raw)
     except Exception:
-        ai = {"title": "Recording", "summary": "", "speakers": 1}
+        ai = _fallback_ai_fields(transcript)
 
     title       = ai.get("title",       "Recording").strip() or "Recording"
     summary     = ai.get("summary",     "")
@@ -1069,6 +1457,208 @@ def _load_app_icon(master):
     return _make_mic_icon(master, GREEN)
 
 
+class ToolTip:
+    def __init__(self, widget, text_fn):
+        self.widget = widget
+        self.text_fn = text_fn if callable(text_fn) else (lambda: str(text_fn))
+        self.tip = None
+        self._after_id = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._hide()
+        self._after_id = self.widget.after(350, self._show)
+
+    def _show(self):
+        text = self.text_fn().strip()
+        if not text:
+            return
+        if self.tip:
+            return
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.attributes("-topmost", True)
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 10
+        self.tip.geometry(f"+{x}+{y}")
+        tk.Label(
+            self.tip,
+            text=text,
+            justify="left",
+            bg="#111827",
+            fg="white",
+            font=("Segoe UI", 9),
+            padx=10,
+            pady=6,
+        ).pack()
+
+    def _hide(self, _event=None):
+        if self._after_id:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+class RoundedButton(tk.Canvas):
+    def __init__(
+        self,
+        master,
+        text,
+        command,
+        *,
+        font=("Segoe UI Semibold", 10),
+        bg="#ffffff",
+        fg="#111827",
+        active_bg=None,
+        disabled_bg="#d1d5db",
+        disabled_fg="#94a3b8",
+        shadow="#d8dee8",
+        radius=14,
+        pad_x=16,
+        pad_y=9,
+        min_width=0,
+        tooltip=None,
+    ):
+        super().__init__(master, highlightthickness=0, bd=0, bg=master.cget("bg"), relief="flat", cursor="hand2")
+        self.command = command
+        self.font = tkfont.Font(font=font)
+        self.text = text
+        self.bg_color = bg
+        self.fg_color = fg
+        self.active_bg = active_bg or bg
+        self.disabled_bg = disabled_bg
+        self.disabled_fg = disabled_fg
+        self.shadow = shadow
+        self.radius = radius
+        self.pad_x = pad_x
+        self.pad_y = pad_y
+        self.min_width = min_width
+        self.shadow_offset = 3
+        self.enabled = True
+        self.hovered = False
+        self.pressed = False
+        self._shape_ids = []
+        self._text_id = None
+        self._draw()
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        if tooltip:
+            ToolTip(self, tooltip)
+
+    def _rounded_points(self, x1, y1, x2, y2, r):
+        return [
+            x1 + r, y1,
+            x2 - r, y1,
+            x2, y1,
+            x2, y1 + r,
+            x2, y2 - r,
+            x2, y2,
+            x2 - r, y2,
+            x1 + r, y2,
+            x1, y2,
+            x1, y2 - r,
+            x1, y1 + r,
+            x1, y1,
+        ]
+
+    def _draw_rounded_rect(self, x1, y1, x2, y2, radius, fill):
+        return self.create_polygon(
+            self._rounded_points(x1, y1, x2, y2, radius),
+            smooth=True,
+            splinesteps=36,
+            fill=fill,
+            outline="",
+        )
+
+    def _current_bg(self):
+        if not self.enabled:
+            return self.disabled_bg
+        if self.pressed or self.hovered:
+            return self.active_bg
+        return self.bg_color
+
+    def _current_fg(self):
+        return self.fg_color if self.enabled else self.disabled_fg
+
+    def _draw(self):
+        self.delete("all")
+        text_w = self.font.measure(self.text)
+        text_h = self.font.metrics("linespace")
+        width = max(self.min_width, text_w + (self.pad_x * 2))
+        height = text_h + (self.pad_y * 2)
+        total_w = width + self.shadow_offset
+        total_h = height + self.shadow_offset
+        self.config(width=total_w, height=total_h)
+        self._draw_rounded_rect(
+            self.shadow_offset,
+            self.shadow_offset,
+            total_w,
+            total_h,
+            self.radius,
+            self.shadow if self.enabled else self.disabled_bg,
+        )
+        self._draw_rounded_rect(0, 0, width, height, self.radius, self._current_bg())
+        self.create_text(
+            width / 2,
+            height / 2,
+            text=self.text,
+            font=self.font,
+            fill=self._current_fg(),
+        )
+
+    def configure_button(self, *, text=None, bg=None, fg=None, active_bg=None, shadow=None):
+        if text is not None:
+            self.text = text
+        if bg is not None:
+            self.bg_color = bg
+        if fg is not None:
+            self.fg_color = fg
+        if active_bg is not None:
+            self.active_bg = active_bg
+        if shadow is not None:
+            self.shadow = shadow
+        self._draw()
+
+    def set_enabled(self, enabled):
+        self.enabled = enabled
+        self.config(cursor="hand2" if enabled else "")
+        self._draw()
+
+    def _on_enter(self, _event):
+        if not self.enabled:
+            return
+        self.hovered = True
+        self._draw()
+
+    def _on_leave(self, _event):
+        self.hovered = False
+        self.pressed = False
+        self._draw()
+
+    def _on_press(self, _event):
+        if not self.enabled:
+            return
+        self.pressed = True
+        self._draw()
+
+    def _on_release(self, event):
+        if not self.enabled:
+            return
+        was_pressed = self.pressed
+        self.pressed = False
+        self._draw()
+        if was_pressed:
+            x1, y1, x2, y2 = 0, 0, self.winfo_width(), self.winfo_height()
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2 and self.command:
+                self.command()
+
+
 class MuesliApp(tk.Tk):
     def __init__(self):
         super().__init__(className="muesli")
@@ -1104,6 +1694,7 @@ class MuesliApp(tk.Tk):
         ensure_windows_shortcuts_if_missing()
 
         self._build_ui()
+        self._bind_shortcuts()
         self._cleanup_stale()
         self._refresh_list()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1292,6 +1883,39 @@ class MuesliApp(tk.Tk):
         ensure_windows_shortcuts(hotkey=hotkey)
         self._status_var.set(f"Launch shortcut set to {hotkey}")
 
+    def _open_settings(self):
+        if not open_settings_dialog(self):
+            return
+        _reset_whisper_cache()
+        _reset_llm_cache()
+        self._refresh_llm_warning()
+        self._status_var.set("Settings saved")
+
+    def _refresh_llm_warning(self):
+        message = _llm_status_message()
+        if message:
+            self._llm_warning_var.set(message)
+            if not self._llm_warning_frame.winfo_ismapped():
+                self._llm_warning_frame.pack(fill="x", before=self._paned)
+        else:
+            if self._llm_warning_frame.winfo_ismapped():
+                self._llm_warning_frame.pack_forget()
+
+    def _bind_shortcuts(self):
+        self.bind_all("<Control-r>", lambda e: (self._toggle_recording(), "break")[1])
+        self.bind_all("<Control-p>", lambda e: (self._edit_prompt(), "break")[1])
+        self.bind_all("<Control-k>", lambda e: (self._set_shortcut(), "break")[1])
+        self.bind_all("<Control-comma>", lambda e: (self._open_settings(), "break")[1])
+        self.bind_all("<Control-o>", lambda e: (self._detail._open_transcript(), "break")[1])
+        self.bind_all("<Control-Shift-C>", lambda e: (self._detail._copy_transcript(), "break")[1])
+        self.bind_all("<space>", self._on_spacebar)
+
+    def _on_spacebar(self, event):
+        if isinstance(event.widget, tk.Text):
+            return None
+        self._toggle_recording()
+        return "break"
+
     # ── Layout ────────────────────────────────────────────────────────────────
     def _build_ui(self):
         # Top bar
@@ -1304,29 +1928,55 @@ class MuesliApp(tk.Tk):
             bg=DARK_BG,
             fg=FG,
         ).pack(side="left")
-        self._rec_btn = tk.Button(
-            top, text="Start Recording",
-            font=("Segoe UI Semibold", 10),
-            bg=RED, fg="white", activebackground="#b42318",
-            relief="flat", bd=0, padx=18, pady=9, cursor="hand2",
-            command=self._toggle_recording
+        self._rec_btn = RoundedButton(
+            top,
+            text="Start Recording",
+            command=self._toggle_recording,
+            font=("Segoe UI Semibold", 15),
+            bg=RED,
+            fg="white",
+            active_bg="#b42318",
+            shadow="#e8b3b3",
+            pad_x=24,
+            pad_y=13,
+            min_width=240,
+            tooltip=lambda: f"Start or stop recording\nCtrl+R\nLaunch and record: {get_launch_hotkey()}",
         )
         self._rec_btn.pack(side="right")
         if not self._recording_available:
-            self._rec_btn.config(state="disabled", bg="#cbd5e1", fg="#64748b", activebackground="#cbd5e1")
-        tk.Button(
-            top, text="Edit Prompt", font=FONT_SM,
-            bg=ITEM_BG, fg=FG,
-            activeforeground=FG, activebackground=ITEM_ALT,
-            relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
-            command=self._edit_prompt
+            self._rec_btn.set_enabled(False)
+        RoundedButton(
+            top,
+            text="Settings",
+            command=self._open_settings,
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            tooltip="Model and runtime settings\nCtrl+,",
         ).pack(side="right", padx=(0, 10))
-        tk.Button(
-            top, text="Set Shortcut", font=FONT_SM,
-            bg=ITEM_BG, fg=FG,
-            activeforeground=FG, activebackground=ITEM_ALT,
-            relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
-            command=self._set_shortcut
+        RoundedButton(
+            top,
+            text="Edit Prompt",
+            command=self._edit_prompt,
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            tooltip="Edit the summary prompt\nCtrl+P",
+        ).pack(side="right", padx=(0, 10))
+        RoundedButton(
+            top,
+            text="Set Shortcut",
+            command=self._set_shortcut,
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            tooltip="Choose the global launch shortcut\nCtrl+K",
         ).pack(side="right", padx=(0, 10))
         self._timer_lbl = tk.Label(top, text="",
                                    font=("Consolas", 12, "bold"),
@@ -1340,11 +1990,27 @@ class MuesliApp(tk.Tk):
                  bg=DARK_BG, fg=FG_DIM, anchor="w", padx=18).pack(fill="x", pady=(0, 8))
         tk.Frame(self, bg=LINE, height=1).pack(fill="x")
 
+        self._llm_warning_var = tk.StringVar(value="")
+        self._llm_warning_frame = tk.Frame(self, bg="#facc15")
+        tk.Label(
+            self._llm_warning_frame,
+            textvariable=self._llm_warning_var,
+            bg="#facc15",
+            fg="#4a3410",
+            anchor="w",
+            justify="left",
+            font=("Segoe UI Semibold", 9),
+            padx=18,
+            pady=10,
+        ).pack(fill="x")
+
         # Main split — draggable PanedWindow
         paned = tk.PanedWindow(self, orient="horizontal",
                                bg=LINE, sashwidth=4, sashpad=0,
                                bd=0, relief="flat")
         paned.pack(fill="both", expand=True)
+        self._paned = paned
+        self._refresh_llm_warning()
 
         # Left list
         left = tk.Frame(paned, bg=PANEL_BG, width=290)
@@ -1372,11 +2038,12 @@ class MuesliApp(tk.Tk):
 
         # Right detail
         self._detail = DetailPanel(paned, self._player,
-                                   on_delete=self._delete_current, bg=DARK_BG)
+                                   on_delete=self._delete_current,
+                                   on_stop_recording=self._stop_recording,
+                                   bg=DARK_BG)
         paned.add(self._detail, minsize=400)
 
         # Redraw list labels when sash is dragged (adapt to new width)
-        self._paned = paned
         self._listbox.bind("<Configure>", self._on_list_resize)
         self._list_last_width = 0
 
@@ -1474,11 +2141,12 @@ class MuesliApp(tk.Tk):
                     f"Recording… ({nn} chunk{'s' if nn != 1 else ''} processed)"))
         )
         self._recorder.start(on_chunk=self._chunk_pipeline.submit)
-        self._rec_btn.config(
+        self._rec_btn.configure_button(
             text="Stop Recording",
             bg="#111827",
             fg="white",
-            activebackground="#1f2937",
+            active_bg="#1f2937",
+            shadow="#c7d0db",
         )
         self.wm_iconphoto(True, self._icon_rec)
         self._status_var.set("Recording...")
@@ -1505,11 +2173,12 @@ class MuesliApp(tk.Tk):
         self._recording = False
         if self._timer_id: self.after_cancel(self._timer_id)
         self._timer_lbl.config(text="")
-        self._rec_btn.config(
+        self._rec_btn.configure_button(
             text="Start Recording",
             bg=RED,
             fg="white",
-            activebackground="#b42318",
+            active_bg="#b42318",
+            shadow="#e8b3b3",
         )
         self.wm_iconphoto(True, self._icon_idle)
         self._status_var.set("Finishing processing...")
@@ -1573,13 +2242,15 @@ class MuesliApp(tk.Tk):
 
 # ── Detail Panel ──────────────────────────────────────────────────────────────
 class DetailPanel(tk.Frame):
-    def __init__(self, parent, player, on_delete=None, **kw):
+    def __init__(self, parent, player, on_delete=None, on_stop_recording=None, **kw):
         super().__init__(parent, **kw)
         self._current   = None
         self._player    = player
         self._on_delete = on_delete
+        self._on_stop_recording = on_stop_recording
         self._tick_id   = None
         self._duration  = 0.0
+        self._live_mode = False
         self._build()
 
     def _build(self):
@@ -1653,9 +2324,6 @@ class DetailPanel(tk.Frame):
         self._audio_btn = self._link_btn(fr, "Open Audio", self._open_audio)
         self._audio_btn.pack(side="left")
         tk.Label(fr, text="   ", bg=PANEL_BG).pack(side="left")
-        self._txt_btn = self._link_btn(fr, "Open Transcript", self._open_transcript)
-        self._txt_btn.pack(side="left")
-        tk.Label(fr, text="   ", bg=PANEL_BG).pack(side="left")
         self._del_btn = tk.Button(fr, text="Delete", font=FONT_SM,
                                   bg=PANEL_BG, fg=RED,
                                   activeforeground=RED, activebackground=PANEL_BG,
@@ -1676,13 +2344,36 @@ class DetailPanel(tk.Frame):
         tr_hdr.pack(fill="x", pady=(0, 2))
         tk.Label(tr_hdr, text="Transcript", font=("Segoe UI Semibold", 9),
                  bg=PANEL_BG, fg=FG_DIM).pack(side="left")
-        self._copy_btn = tk.Button(
-            tr_hdr, text="Copy", font=FONT_SM,
-            bg=PANEL_BG, fg=FG_LINK,
-            activeforeground=FG, activebackground=PANEL_BG,
-            relief="flat", bd=0, padx=4, cursor="hand2",
-            command=self._copy_transcript)
-        self._copy_btn.pack(side="left", padx=(6, 0))
+        self._open_transcript_btn = RoundedButton(
+            tr_hdr,
+            text="🗒",
+            command=self._open_transcript,
+            font=("Segoe UI Emoji", 10),
+            bg=ITEM_BG,
+            fg=FG,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            pad_x=9,
+            pad_y=5,
+            tooltip="Open transcript file\nCtrl+O",
+        )
+        self._open_transcript_btn.pack(side="left", padx=(8, 0))
+        self._copy_btn = RoundedButton(
+            tr_hdr,
+            text="Copy",
+            command=self._copy_transcript,
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            pad_x=12,
+            pad_y=6,
+            tooltip="Copy transcript\nCtrl+Shift+C",
+        )
+        self._copy_btn.pack(side="left", padx=(8, 0))
+        self._open_transcript_btn.set_enabled(False)
+        self._copy_btn.set_enabled(False)
         self._transcript_txt = tk.Text(c, height=10, wrap="word",
                                        bg=ITEM_BG, fg=FG, relief="flat", bd=0,
                                        font=FONT_MON, padx=10, pady=8, state="disabled")
@@ -1697,6 +2388,7 @@ class DetailPanel(tk.Frame):
     # ── Show ──────────────────────────────────────────────────────────────────
     def show_live(self):
         """Prepare the detail panel for live recording display."""
+        self._live_mode = True
         self._current = None
         self._placeholder.pack_forget()
         self._content.pack(fill="both", expand=True)
@@ -1707,13 +2399,15 @@ class DetailPanel(tk.Frame):
         self._speakers_lbl.config(text="")
         self._status_lbl.config(text="Recording...", fg=YELLOW)
         self._play_btn.config(state="disabled")
-        self._stop_btn.config(state="disabled")
+        self._stop_btn.config(state="normal")
         self._audio_btn.config(state="disabled", fg=FG_DIM)
-        self._txt_btn.config(state="disabled", fg=FG_DIM)
+        self._open_transcript_btn.set_enabled(False)
+        self._copy_btn.set_enabled(False)
         self._set_text(self._summary_txt, "")
         self.set_live_transcript("", processing=True)
 
     def show(self, meta):
+        self._live_mode = False
         # Stop playback if switching to a different recording
         if self._current and self._current.get("slug") != meta.get("slug"):
             self._player.stop()
@@ -1756,8 +2450,8 @@ class DetailPanel(tk.Frame):
         has_txt   = os.path.exists(_txt_path(slug))
         self._audio_btn.config(state="normal" if has_audio else "disabled",
                                fg=FG_LINK if has_audio else FG_DIM)
-        self._txt_btn.config(state="normal"  if has_txt   else "disabled",
-                             fg=FG_LINK if has_txt   else FG_DIM)
+        self._open_transcript_btn.set_enabled(has_txt)
+        self._copy_btn.set_enabled(bool(meta.get("transcript", "")))
         self._play_btn.config(state="normal" if has_audio else "disabled")
         self._stop_btn.config(state="normal" if has_audio else "disabled")
 
@@ -1779,6 +2473,9 @@ class DetailPanel(tk.Frame):
             self._stop_tick()
 
     def _on_stop(self):
+        if self._live_mode and self._on_stop_recording:
+            self._on_stop_recording()
+            return
         self._player.stop()
         self._stop_tick()
         self._update_transport()
@@ -1836,16 +2533,21 @@ class DetailPanel(tk.Frame):
             self.clipboard_clear()
             self.clipboard_append(text)
             # Brief visual feedback
-            orig = self._copy_btn.cget("fg")
-            self._copy_btn.config(fg=GREEN)
-            self.after(800, lambda: self._copy_btn.config(fg=orig))
+            self._copy_btn.configure_button(bg="#e0f2fe", fg=FG)
+            self.after(
+                800,
+                lambda: self._copy_btn.configure_button(bg=ITEM_BG, fg=FG),
+            )
 
     def clear(self):
         """Reset the detail panel to the placeholder state."""
+        self._live_mode = False
         self._current = None
         self._stop_tick()
         self._content.pack_forget()
         self._placeholder.pack(expand=True)
+        self._open_transcript_btn.set_enabled(False)
+        self._copy_btn.set_enabled(False)
 
     def set_live_transcript(self, text, processing=True):
         """Update transcript widget with live text during recording."""
@@ -1859,6 +2561,7 @@ class DetailPanel(tk.Frame):
             w.tag_config("dim", foreground=FG_DIM)
         w.see("end")
         w.config(state="disabled")
+        self._copy_btn.set_enabled(bool(text))
 
     def _set_text(self, w, text):
         w.config(state="normal")

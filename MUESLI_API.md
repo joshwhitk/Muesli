@@ -45,7 +45,7 @@ Returned `session` data includes fields such as:
     "speakers": 3,
     "duration": 323.5,
     "started_at": "2026-04-22T10:30:00",
-    "audio_path": "C:/Users/Josh/Documents/MuesliData/analytics/audio/2026-04-22_10-30-00.mp3",
+    "audio_path": "C:/Users/<you>/Documents/MuesliData/analytics/audio/2026-04-22_10-30-00.mp3",
     "status": "done"
 }
 ```
@@ -130,7 +130,7 @@ Common settings:
 
 ```json
 {
-  "shared_dir": "C:\\Users\\Josh\\Documents\\MuesliData\\analytics\\audio",
+  "shared_dir": "C:\\Users\\<you>\\Documents\\MuesliData\\analytics\\audio",
   "whisper_model": "large-v3",
   "whisper_device": "auto"
 }

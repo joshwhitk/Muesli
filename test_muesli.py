@@ -1,4 +1,4 @@
-#!/home/algorithm/venv/bin/python3
+#!/usr/bin/env python3
 """Quick smoke test for the muesli module API."""
 
 import sys, os, wave, struct, tempfile, time

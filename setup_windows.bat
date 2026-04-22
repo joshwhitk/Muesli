@@ -24,6 +24,14 @@ if not exist ".venv\Scripts\python.exe" (
 echo Installing Python packages...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+where nvidia-smi >nul 2>&1
+if not errorlevel 1 (
+    echo NVIDIA GPU detected. Installing CUDA runtime packages for faster-whisper...
+    ".venv\Scripts\python.exe" -m pip install nvidia-cublas-cu12 nvidia-cuda-runtime-cu12
+    if errorlevel 1 (
+        echo WARNING: CUDA runtime packages did not install. Whisper will fall back to CPU.
+    )
+)
 echo Installing optional recording dependencies...
 ".venv\Scripts\python.exe" -m pip install sounddevice
 ".venv\Scripts\python.exe" -m pip install pyaudio

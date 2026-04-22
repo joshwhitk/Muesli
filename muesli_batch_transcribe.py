@@ -12,7 +12,7 @@ import wave
 
 from faster_whisper import WhisperModel
 
-DEFAULT_INPUT = Path(r"\\ALGORITHM-INSPIRON-3537\algorithm\analytics\audio")
+DEFAULT_INPUT = Path.home() / "Documents" / "MuesliData" / "analytics" / "audio"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = PROJECT_DIR / "outputs"
 
