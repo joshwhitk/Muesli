@@ -1,0 +1,6 @@
+faster-whisper
+llama-cpp-python
+pygame-ce
+huggingface-hub
+anthropic
+sounddevice

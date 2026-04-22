@@ -1,0 +1,31 @@
+# Secrets
+config.json
+
+# Model files (too large for git — downloaded by install script)
+models/*.gguf
+
+# User data
+recordings/
+outputs/
+.tmp/
+prompt.txt
+*.pid
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
