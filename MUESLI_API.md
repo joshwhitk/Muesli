@@ -1,97 +1,151 @@
-# Muesli API — for the Algorithm v4 integration
+# Muesli API
 
-## Setup
+`muesli.py` exposes the recording, transcription, summarization, and session-browsing functionality as a Python API.
 
-Add granola to your Python path:
-```python
-sys.path.insert(0, "/home/algorithm/granola")
-```
+## Import
 
-Then import:
+If you are using the repo directly:
+
 ```python
 from muesli import Muesli
 ```
 
-## Quick start
+If you are embedding it from another project, add the repo directory to `sys.path` first.
+
+## Quick Start
 
 ```python
-m = Muesli()              # lazy init, no resume
-m = Muesli(auto_resume=True)  # also resumes interrupted sessions on startup
+from muesli import Muesli
 
-# ── Record a meeting ──────────────────────────────────────────
+m = Muesli()
 m.start_recording()
-# ... time passes, chunks transcribe in background ...
 session = m.stop_recording()
-# session = {
-#   "slug": "weekly-team-standup",
-#   "title": "Weekly Team Standup",
-#   "summary": "The team discussed sprint progress...",
-#   "transcript": "Okay let's get started...",
-#   "speakers": 3,
-#   "corrections": "...",
-#   "bugs": "...",
-#   "duration": 323.5,
-#   "started_at": "2026-04-14T10:30:00",
-#   "audio_path": "/srv/al/muesli/weekly-team-standup.mp3",
-#   "status": "done"
-# }
+print(session["title"])
+print(session["summary"])
+```
 
-# ── Process an existing audio file ───────────────────────────
-session = m.process_file("/path/to/audio.wav")
-# same return shape as above
+## Main Entry Points
 
-# ── Transcribe only (no summary) ─────────────────────────────
-text = m.transcribe("/path/to/audio.wav")
-# returns plain string
+### Record from microphone
 
-# ── Summarize a transcript ────────────────────────────────────
-info = m.summarize("Okay let's get started. So where are we on the API...")
-# returns {"title": "...", "summary": "...", "speakers": N, "corrections": "...", "bugs": "..."}
+```python
+m = Muesli()
+m.start_recording()
+session = m.stop_recording()
+```
 
-# ── Browse past sessions ──────────────────────────────────────
-sessions = m.list_sessions()       # list of session dicts, newest first
-session  = m.get_session("slug")   # single session dict or None
+Returned `session` data includes fields such as:
 
-# ── Audio file access ─────────────────────────────────────────
-path = m.audio_path("slug")   # "/srv/al/muesli/slug.mp3" (or .wav), or None
-exists = m.audio_exists("slug")
+```python
+{
+    "slug": "2026-04-22_10-30-00",
+    "title": "Weekly Standup",
+    "summary": "The team reviewed progress and open issues.",
+    "transcript": "...",
+    "speakers": 3,
+    "duration": 323.5,
+    "started_at": "2026-04-22T10:30:00",
+    "audio_path": "C:/Users/Josh/Documents/MuesliData/analytics/audio/2026-04-22_10-30-00.mp3",
+    "status": "done"
+}
+```
 
-# ── Live transcript callback (optional) ───────────────────────
+### Process an existing file
+
+```python
+session = m.process_file("example.wav")
+```
+
+### Transcribe only
+
+```python
+text = m.transcribe("example.wav")
+```
+
+### Summarize only
+
+```python
+info = m.summarize("Transcript text goes here.")
+```
+
+### Browse sessions
+
+```python
+sessions = m.list_sessions()
+session = m.get_session("2026-04-22_10-30-00")
+```
+
+### Check audio paths
+
+```python
+path = m.audio_path("2026-04-22_10-30-00")
+exists = m.audio_exists("2026-04-22_10-30-00")
+```
+
+## Optional Callback During Recording
+
+You can receive live chunk updates while recording:
+
+```python
 def on_chunk(chunk_num, text_so_far):
-    print(f"Chunk {chunk_num}: {text_so_far}")
+    print(chunk_num, text_so_far)
 
 m.start_recording(on_transcribed=on_chunk)
 session = m.stop_recording()
+```
 
-# ── Resume interrupted sessions ──────────────────────────────
-# If the app was killed mid-processing, audio is still on disk.
-# resume_interrupted() finds those sessions and re-runs transcribe + summarize.
+## Resume Interrupted Sessions
+
+If the app is interrupted during processing, you can resume unfinished sessions:
+
+```python
 def on_resume(slug, stage):
-    print(f"{slug}: {stage}")  # "resuming", "transcribing", "summarising", "done", "no_audio"
+    print(slug, stage)
 
+m = Muesli(auto_resume=True)
 completed = m.resume_interrupted(on_progress=on_resume)
-# returns list of completed session dicts
-
-# Or just pass auto_resume=True to __init__ to do this automatically (no callback).
 ```
 
-## Notes
+Typical progress stages include:
 
-- First call to `transcribe()` or `start_recording()` loads the Whisper model (~1s on SSD, uses ~1GB RAM).
-- First call to `summarize()` or `process_file()` loads the local LLM (~2s, uses ~2.5GB RAM). Falls back to Claude API if no GGUF model present.
-- `stop_recording()` blocks until all chunks are transcribed + summarized + audio is converted to MP3 and saved. Typical: 5-15s after a few-minute recording.
-- Whisper transcription on CPU runs at roughly 1-2x realtime — a 30-minute recording takes 15-30 minutes to transcribe.
-- Audio files live in the shared dir (default `/srv/al/muesli/`). JSON metadata lives in `/home/algorithm/granola/recordings/`.
-- All methods are synchronous. For async use, call from a thread.
-- The `session` dict is the same shape everywhere — it's the JSON that gets saved to `recordings/{slug}.json`, plus an `audio_path` key.
-- On startup, the GUI app (`granola.py`) automatically resumes any interrupted sessions and shows animated progress in the status bar.
+- `resuming`
+- `transcribing`
+- `summarising`
+- `done`
+- `no_audio`
 
-## Testing
+## Runtime Notes
 
-Run the smoke test:
+- Whisper is loaded lazily on first use.
+- Summarization is also loaded lazily.
+- `stop_recording()` is synchronous and waits for final processing to finish.
+- Audio files are written to the configured shared directory.
+- Session metadata is stored under `recordings/` in the repo directory by default.
+
+## Configuration
+
+The API reads `config.json` when present.
+
+Common settings:
+
+```json
+{
+  "shared_dir": "C:\\Users\\Josh\\Documents\\MuesliData\\analytics\\audio",
+  "whisper_model": "large-v3",
+  "whisper_device": "auto"
+}
+```
+
+## Smoke Test
+
+There is a simple smoke test script in the repo root:
+
+```powershell
+.venv\Scripts\python.exe test_muesli.py
+```
+
+or on Linux:
+
 ```bash
-cd /home/algorithm/granola
-/home/algorithm/venv/bin/python test_muesli.py
+.venv/bin/python test_muesli.py
 ```
-
-Tests all API methods: init, list/get sessions, audio access, transcribe (silent wav), summarize, process_file, and resume_interrupted. Takes ~1-2 minutes (model loading dominates).

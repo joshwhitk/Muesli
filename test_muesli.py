@@ -6,6 +6,7 @@ import sys, os, wave, struct, tempfile, time
 sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import muesli as muesli_module
 from muesli import Muesli
 
 PASS = 0
@@ -123,8 +124,8 @@ finally:
 print("\n[8] resume_session")
 # Create a fake interrupted session with a tiny audio file
 _test_slug = "_test_resume_check"
-_test_wav = os.path.join("/home/algorithm/granola/recordings", _test_slug + ".wav")
-_test_json = os.path.join("/home/algorithm/granola/recordings", _test_slug + ".json")
+_test_wav = os.path.join(muesli_module.REC_DIR, _test_slug + ".wav")
+_test_json = os.path.join(muesli_module.REC_DIR, _test_slug + ".json")
 make_silent_wav(_test_wav, duration_s=2)
 import json as _json
 _meta = {
@@ -153,7 +154,7 @@ print(f"       slug: {result.get('slug')}, events: {progress_log}")
 for _p in [_test_json, _test_wav]:
     if os.path.exists(_p):
         os.remove(_p)
-for _d in ["/home/algorithm/granola/recordings", m._shared_dir]:
+for _d in [muesli_module.REC_DIR, m._shared_dir]:
     for _f in os.listdir(_d):
         if "_test" in _f or _f.startswith("recording") and _f.endswith((".json", ".wav", ".mp3", ".txt")):
             try: os.remove(os.path.join(_d, _f))
