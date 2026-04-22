@@ -184,6 +184,14 @@ Example options:
 
 If no local summary model is available, the code can fall back to Anthropic if you provide an API key in `config.json`.
 
+### Ollama on Windows
+
+When Muesli uses Ollama for summaries, the GPU-heavy work runs inside the global Ollama service (`ollama.exe` / `ollama.exe runner`), not inside the Muesli process itself.
+
+- Task Manager will usually show that work as `ollama.exe`, not as `Muesli`
+- Muesli cannot reliably rename those processes or force Task Manager to group them under Muesli without changing the execution model
+- The practical fix is better in-app visibility: show the active backend, model, and runtime status clearly inside Muesli
+
 ## Windows Hotkey
 
 Muesli ships with a small background listener on Windows so the launch-and-record shortcut works system-wide.
@@ -251,6 +259,7 @@ outputs/                    batch outputs and sidecar mirror (not committed)
 - Add export to Obsidian workflow
 - Add a simple transcription progress diagram in the session view
 - Fix speaker counting for multi-speaker clips such as "I guess I'm going to"
+- Add clearer Ollama runtime visibility in-app so users can tell when background GPU usage comes from Muesli-driven summaries
 
 ## Documentation
 
