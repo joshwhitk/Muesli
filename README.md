@@ -248,6 +248,9 @@ outputs/                    batch outputs and sidecar mirror (not committed)
 - Add a settings panel for model and runtime configuration
 - Improve packaging so the pinned taskbar icon no longer depends on Python
 - Expand tests beyond smoke checks
+- Add export to Obsidian workflow
+- Add a simple transcription progress diagram in the session view
+- Fix speaker counting for multi-speaker clips such as "I guess I'm going to"
 
 ## Documentation
 

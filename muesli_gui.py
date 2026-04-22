@@ -19,6 +19,8 @@ import socket
 import ctypes
 import importlib.util
 import shutil
+import urllib.request
+import urllib.error
 import pygame
 
 try:
@@ -51,6 +53,8 @@ CONFIG_FILE  = os.path.join(APP_DIR, "config.json")
 PROMPT_FILE  = os.path.join(APP_DIR, "prompt.txt")
 ICON_PNG     = os.path.join(ASSETS_DIR, "muesli-icon.png")
 ICON_ICO     = os.path.join(ASSETS_DIR, "muesli-icon.ico")
+NOTEPAD_ICON_PNG = os.path.join(ASSETS_DIR, "notepad-win.png")
+COPY_ICON_PNG = os.path.join(ASSETS_DIR, "copy-win.png")
 DESKTOP_SHORTCUT = os.path.join(os.path.expanduser("~"), "Desktop", "Muesli.lnk")
 START_MENU_DIR   = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs")
 STARTUP_DIR      = os.path.join(START_MENU_DIR, "Startup")
@@ -131,7 +135,7 @@ def _normalize_config(cfg):
     normalized["whisper_device"] = whisper_device if whisper_device in ("auto", "cpu", "cuda") else "auto"
 
     backend = str(normalized.get("llm_backend", "auto")).lower()
-    normalized["llm_backend"] = backend if backend in ("auto", "anthropic", "local") else "auto"
+    normalized["llm_backend"] = backend if backend in ("auto", "anthropic", "ollama", "local") else "auto"
     return normalized
 
 
@@ -398,7 +402,9 @@ def open_settings_dialog(master):
     whisper_quality = tk.StringVar(value=cfg.get("whisper_quality", _default_whisper_quality()))
     llm_backend = tk.StringVar(value=cfg.get("llm_backend", "auto"))
     gguf_models = _list_gguf_models()
+    ollama_models = _list_ollama_models()
     llm_local_model = tk.StringVar(value=cfg.get("llm_local_model", gguf_models[0] if gguf_models else ""))
+    ollama_model = tk.StringVar(value=cfg.get("ollama_model", _recommend_ollama_model(ollama_models) or ""))
     saved = {"ok": False}
 
     def _section(parent, title, subtitle):
@@ -452,6 +458,7 @@ def open_settings_dialog(master):
     backend_map = {
         "Auto": "auto",
         "Anthropic": "anthropic",
+        "Ollama": "ollama",
         "Local GGUF": "local",
     }
     backend_labels = list(backend_map.keys())
@@ -463,6 +470,27 @@ def open_settings_dialog(master):
         state="readonly",
         width=18,
     ).pack(anchor="w", padx=14, pady=(0, 10))
+    if ollama_models:
+        recommended = _recommend_ollama_model(ollama_models)
+        ollama_note = f"Installed models: {len(ollama_models)}"
+        if recommended:
+            ollama_note += f"  |  Recommended: {recommended}"
+        tk.Label(llm_frame, text=ollama_note, bg=PANEL_BG, fg=FG_DIM, font=FONT_SM).pack(anchor="w", padx=14)
+        ttk.Combobox(
+            llm_frame,
+            textvariable=ollama_model,
+            values=ollama_models,
+            state="readonly",
+            width=42,
+        ).pack(anchor="w", padx=14, pady=(4, 12))
+    else:
+        tk.Label(
+            llm_frame,
+            text="Ollama not detected or no Ollama models are installed.",
+            bg=PANEL_BG,
+            fg=FG_DIM,
+            font=FONT_SM,
+        ).pack(anchor="w", padx=14, pady=(4, 12))
     if gguf_models:
         tk.Label(llm_frame, text="Local GGUF model", bg=PANEL_BG, fg=FG_DIM, font=FONT_SM).pack(anchor="w", padx=14)
         ttk.Combobox(
@@ -489,6 +517,8 @@ def open_settings_dialog(master):
         updated["whisper_quality"] = whisper_quality.get()
         updated["whisper_model"] = WHISPER_QUALITY_MODELS[updated["whisper_quality"]]
         updated["llm_backend"] = backend_map.get(backend_display.get(), "auto")
+        if ollama_models and ollama_model.get() in ollama_models:
+            updated["ollama_model"] = ollama_model.get()
         if gguf_models and llm_local_model.get() in gguf_models:
             updated["llm_local_model"] = llm_local_model.get()
         save_config(updated)
@@ -602,58 +632,24 @@ def slug_from_title(title):
     return (s[:60] or "recording")
 
 
+def default_session_title(started_at):
+    try:
+        dt = datetime.datetime.fromisoformat(started_at)
+        return dt.strftime("%Y-%m-%d %I-%M %p").replace(" 0", " ")
+    except Exception:
+        return "Recording"
+
+
 def _clean_sentence(text):
     text = re.sub(r"\s+", " ", (text or "")).strip()
     return text.strip(" -,:;")
 
 
 def _fallback_ai_fields(transcript):
-    text = _clean_sentence(transcript)
-    if not text:
-        return {
-            "title": "Recording",
-            "summary": "",
-            "speakers": 1,
-            "corrections": "",
-            "bugs": "",
-        }
-
-    sentences = [
-        _clean_sentence(part)
-        for part in re.split(r"(?<=[.!?])\s+", text)
-        if _clean_sentence(part)
-    ]
-    if not sentences:
-        sentences = [text]
-
-    summary = " ".join(sentences[:2]).strip()
-    if len(summary) > 320:
-        summary = summary[:317].rstrip() + "..."
-
-    stop = {
-        "the", "and", "for", "with", "that", "this", "from", "have", "just",
-        "they", "them", "then", "into", "about", "your", "there", "will",
-        "would", "could", "should", "what", "when", "where", "which",
-    }
-    words = re.findall(r"[A-Za-z0-9']+", sentences[0])
-    title_words = []
-    for word in words:
-        lower = word.lower()
-        if lower in stop:
-            continue
-        title_words.append(word.capitalize())
-        if len(title_words) == 5:
-            break
-    if not title_words:
-        title_words = [word.capitalize() for word in words[:4]] or ["Recording"]
-
-    speaker_matches = set(re.findall(r"\b(?:speaker|spk)\s*([0-9]+)\b", text, flags=re.I))
-    speakers = max(1, len(speaker_matches))
-
     return {
-        "title": " ".join(title_words).strip() or "Recording",
-        "summary": summary,
-        "speakers": speakers,
+        "title": "",
+        "summary": "",
+        "speakers": 0,
         "corrections": "",
         "bugs": "",
     }
@@ -721,19 +717,31 @@ def delete_recording(meta):
     for ext in (".mp3", ".wav"):
         path = os.path.join(SHARED_DIR, slug + ext)
         if os.path.exists(path):
-            os.remove(path)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     # Delete transcript txt
     txt = _txt_path(slug)
     if os.path.exists(txt):
-        os.remove(txt)
+        try:
+            os.remove(txt)
+        except OSError:
+            pass
     # Delete metadata JSON
     meta_path = os.path.join(REC_DIR, slug + ".json")
     if os.path.exists(meta_path):
-        os.remove(meta_path)
+        try:
+            os.remove(meta_path)
+        except OSError:
+            pass
     # Delete local WAV if still present
     local_wav = os.path.join(REC_DIR, slug + ".wav")
     if os.path.exists(local_wav):
-        os.remove(local_wav)
+        try:
+            os.remove(local_wav)
+        except OSError:
+            pass
 
 # ── AI Processing ─────────────────────────────────────────────────────────────
 _whisper_model = None
@@ -852,6 +860,7 @@ def _transcribe_segments(audio_path, **kwargs):
 # ── Local LLM ────────────────────────────────────────────────────────────────
 _llm_model = None
 _LLM_MODEL_DIR = os.path.join(APP_DIR, "models")
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 
 def _list_gguf_models():
     if not os.path.isdir(_LLM_MODEL_DIR):
@@ -870,6 +879,60 @@ def _selected_gguf_model_path():
     return None
 
 
+def _ollama_request(path, payload=None, timeout=3):
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"{_OLLAMA_BASE_URL}{path}", data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+    return json.loads(body) if body else {}
+
+
+def _list_ollama_models():
+    try:
+        payload = _ollama_request("/api/tags")
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return []
+    models = [m.get("name", "").strip() for m in payload.get("models", [])]
+    return [m for m in models if m]
+
+
+def _recommend_ollama_model(models):
+    if not models:
+        return None
+    lowered = {name.lower(): name for name in models}
+    for candidate in (
+        "qwen3.5:4b",
+        "qwen3.5:9b",
+        "qwen3:8b",
+        "gemma4:e4b",
+        "gemma4:4b",
+        "llama3.1:8b",
+        "mistral:7b",
+        "phi4",
+        "deepseek-r1:8b",
+    ):
+        if candidate in lowered:
+            return lowered[candidate]
+    filtered = [
+        name for name in models
+        if not any(token in name.lower() for token in ("coder", "code", "vl", "vision", "embed", "cloud"))
+    ]
+    return filtered[0] if filtered else models[0]
+
+
+def _selected_ollama_model():
+    cfg = load_config()
+    selected = str(cfg.get("ollama_model", "")).strip()
+    models = _list_ollama_models()
+    if selected and selected in models:
+        return selected
+    return _recommend_ollama_model(models)
+
+
 def _llm_backend():
     cfg = load_config()
     return str(cfg.get("llm_backend", "auto")).lower()
@@ -881,20 +944,26 @@ def _llm_status_message():
     has_anthropic_pkg = importlib.util.find_spec("anthropic") is not None
     has_llama_pkg = importlib.util.find_spec("llama_cpp") is not None
     local_model_path = _selected_gguf_model_path()
+    ollama_model = _selected_ollama_model()
     local_ready = bool(local_model_path and has_llama_pkg)
     anthropic_ready = bool(api_key and has_anthropic_pkg)
+    ollama_ready = bool(ollama_model)
 
     if backend == "anthropic":
         if anthropic_ready:
             return None
         return "LLM unavailable: Anthropic is selected, but the API key or Anthropic package is missing. Summaries will use transcript-only fallback."
+    if backend == "ollama":
+        if ollama_ready:
+            return None
+        return "LLM unavailable: Ollama is selected, but the local Ollama service or model is unavailable. Summaries will use transcript-only fallback."
     if backend == "local":
         if local_ready:
             return None
         return "LLM unavailable: Local GGUF is selected, but no usable local model is configured. Summaries will use transcript-only fallback."
-    if anthropic_ready or local_ready:
+    if anthropic_ready or ollama_ready or local_ready:
         return None
-    return "LLM unavailable: no Anthropic key and no local GGUF model detected. Summaries will use transcript-only fallback."
+    return "LLM unavailable: no Anthropic key, Ollama model, or local GGUF model detected. Summaries will use transcript-only fallback."
 
 
 def _reset_llm_cache():
@@ -927,6 +996,7 @@ def _llm_generate(prompt_text):
     backend = _llm_backend()
     api_key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
     anthropic_allowed = backend in ("auto", "anthropic")
+    ollama_allowed = backend in ("auto", "ollama")
     local_allowed = backend in ("auto", "local")
 
     if anthropic_allowed and api_key:
@@ -943,6 +1013,25 @@ def _llm_generate(prompt_text):
 
     if backend == "anthropic" and not api_key:
         raise RuntimeError("Anthropic is selected but no API key is configured")
+
+    if ollama_allowed:
+        try:
+            model_name = _selected_ollama_model()
+            if not model_name:
+                raise RuntimeError("No Ollama model is installed")
+            resp = _ollama_request(
+                "/api/generate",
+                {"model": model_name, "prompt": prompt_text, "stream": False},
+                timeout=120,
+            )
+            text = str(resp.get("response", "")).strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+    if backend == "ollama":
+        raise RuntimeError("Ollama is selected but no usable Ollama model is available")
 
     if local_allowed:
         try:
@@ -1032,7 +1121,7 @@ class ChunkPipeline:
 
 def _ffmpeg_available():
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, **_hidden_subprocess_kwargs())
         return True
     except Exception:
         return False
@@ -1072,7 +1161,7 @@ def process_recording(meta, on_update, transcript=None, summaries=None):
                 subprocess.run(
                     ["ffmpeg", "-y", "-i", wav_path,
                      "-ac", "1", "-ar", "16000", "-b:a", "64k", mp3_path],
-                    capture_output=True, check=True
+                    capture_output=True, check=True, **_hidden_subprocess_kwargs()
                 )
                 if os.path.exists(wav_path):
                     os.remove(wav_path)
@@ -1115,6 +1204,7 @@ def process_recording(meta, on_update, transcript=None, summaries=None):
 
     # Summarise with local LLM
     on_update(meta, "summarising…")
+    llm_used = False
     try:
         if summaries and any(summaries):
             # Merge chunk summaries (short input — fast)
@@ -1129,23 +1219,28 @@ def process_recording(meta, on_update, transcript=None, summaries=None):
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
         raw = re.sub(r"\n?```$",        "", raw)
         ai  = json.loads(raw)
+        llm_used = True
     except Exception:
         ai = _fallback_ai_fields(transcript)
 
-    title       = ai.get("title",       "Recording").strip() or "Recording"
-    summary     = ai.get("summary",     "")
-    speakers    = int(ai.get("speakers", 1))
+    default_title = default_session_title(meta.get("started_at", ""))
+    title       = ai.get("title", "").strip() or default_title
+    summary     = ai.get("summary", "").strip() if llm_used else ""
+    speakers    = int(ai.get("speakers", 0) or 0) if llm_used else 0
     corrections = ai.get("corrections", "")
     bugs        = ai.get("bugs",        "")
 
-    # Build slug from title, avoid collisions
-    new_slug  = slug_from_title(title)
-    candidate = new_slug
-    i = 2
-    while (os.path.exists(os.path.join(REC_DIR, candidate + ".json")) and
-           candidate != slug):
-        candidate = f"{new_slug}-{i}"; i += 1
-    new_slug = candidate
+    # Only rename files when an LLM supplied a real title.
+    new_slug = slug
+    if llm_used and title:
+        base_slug = slug_from_title(title)
+        candidate = base_slug
+        i = 2
+        while (os.path.exists(os.path.join(REC_DIR, candidate + ".json")) and
+               candidate != slug):
+            candidate = f"{base_slug}-{i}"
+            i += 1
+        new_slug = candidate
 
     # Rename audio file if slug changed
     if new_slug != slug:
@@ -1157,7 +1252,9 @@ def process_recording(meta, on_update, transcript=None, summaries=None):
                 break
 
     # Write combined markdown to shared folder
-    txt_body = f"# {title}\n\n## Summary\n\n{summary}\n\n"
+    txt_body = f"# {title}\n\n"
+    if summary:
+        txt_body += f"## Summary\n\n{summary}\n\n"
     if corrections:
         txt_body += f"## Transcription Corrections\n\n{corrections}\n\n"
     if bugs:
@@ -1286,10 +1383,11 @@ class Recorder:
         wf.writeframes(b"".join(self._frames))
         wf.close()
 
+        started_at = datetime.datetime.now().isoformat()
         meta = {
             "slug":       self._slug,
-            "title":      self._slug,
-            "started_at": datetime.datetime.now().isoformat(),
+            "title":      default_session_title(started_at),
+            "started_at": started_at,
             "duration":   duration,
             "status":     "processing",
             "summary":    "",
@@ -1342,6 +1440,15 @@ class Player:
         pygame.mixer.music.stop()
         self._state     = "stopped"
         self._pause_pos = 0.0
+
+    def clear(self):
+        self.stop()
+        try:
+            if hasattr(pygame.mixer.music, "unload"):
+                pygame.mixer.music.unload()
+        except Exception:
+            pass
+        self._path = None
 
     def toggle(self):
         if self._state == "playing": self.pause()
@@ -1522,6 +1629,8 @@ class RoundedButton(tk.Canvas):
         pad_y=9,
         min_width=0,
         tooltip=None,
+        icon_image=None,
+        icon_gap=8,
     ):
         super().__init__(master, highlightthickness=0, bd=0, bg=master.cget("bg"), relief="flat", cursor="hand2")
         self.command = command
@@ -1541,6 +1650,8 @@ class RoundedButton(tk.Canvas):
         self.enabled = True
         self.hovered = False
         self.pressed = False
+        self.icon_image = icon_image
+        self.icon_gap = icon_gap
         self._shape_ids = []
         self._text_id = None
         self._draw()
@@ -1590,8 +1701,16 @@ class RoundedButton(tk.Canvas):
         self.delete("all")
         text_w = self.font.measure(self.text)
         text_h = self.font.metrics("linespace")
-        width = max(self.min_width, text_w + (self.pad_x * 2))
-        height = text_h + (self.pad_y * 2)
+        icon_w = self.icon_image.width() if self.icon_image else 0
+        icon_h = self.icon_image.height() if self.icon_image else 0
+        content_w = text_w
+        if icon_w:
+            content_w += icon_w
+            if self.text:
+                content_w += self.icon_gap
+        content_h = max(text_h, icon_h)
+        width = max(self.min_width, content_w + (self.pad_x * 2))
+        height = content_h + (self.pad_y * 2)
         total_w = width + self.shadow_offset
         total_h = height + self.shadow_offset
         self.config(width=total_w, height=total_h)
@@ -1604,15 +1723,20 @@ class RoundedButton(tk.Canvas):
             self.shadow if self.enabled else self.disabled_bg,
         )
         self._draw_rounded_rect(0, 0, width, height, self.radius, self._current_bg())
-        self.create_text(
-            width / 2,
-            height / 2,
-            text=self.text,
-            font=self.font,
-            fill=self._current_fg(),
-        )
+        cursor_x = width / 2 - (content_w / 2)
+        if icon_w:
+            self.create_image(cursor_x + (icon_w / 2), height / 2, image=self.icon_image)
+            cursor_x += icon_w + (self.icon_gap if self.text else 0)
+        if self.text:
+            self.create_text(
+                cursor_x + (text_w / 2),
+                height / 2,
+                text=self.text,
+                font=self.font,
+                fill=self._current_fg(),
+            )
 
-    def configure_button(self, *, text=None, bg=None, fg=None, active_bg=None, shadow=None):
+    def configure_button(self, *, text=None, bg=None, fg=None, active_bg=None, shadow=None, icon_image=None):
         if text is not None:
             self.text = text
         if bg is not None:
@@ -1623,6 +1747,8 @@ class RoundedButton(tk.Canvas):
             self.active_bg = active_bg
         if shadow is not None:
             self.shadow = shadow
+        if icon_image is not None:
+            self.icon_image = icon_image
         self._draw()
 
     def set_enabled(self, enabled):
@@ -1690,6 +1816,8 @@ class MuesliApp(tk.Tk):
         # Taskbar icons — idle and recording states
         self._icon_idle = _load_app_icon(self)
         self._icon_rec  = self._icon_idle
+        self._notepad_icon = self._load_detail_icon(NOTEPAD_ICON_PNG)
+        self._copy_icon = self._load_detail_icon(COPY_ICON_PNG)
         self.wm_iconphoto(True, self._icon_idle)
         ensure_windows_shortcuts_if_missing()
 
@@ -2033,13 +2161,18 @@ class MuesliApp(tk.Tk):
         self._listbox.pack(fill="both", expand=True)
         sb.config(command=self._listbox.yview)
         self._listbox.bind("<<ListboxSelect>>", self._on_select)
+        self._listbox.bind("<ButtonRelease-1>", self._rename_selected_on_click, add="+")
+        self._listbox.bind("<Double-Button-1>", self._rename_selected_from_list)
 
         paned.add(left, minsize=150, width=270)
 
         # Right detail
         self._detail = DetailPanel(paned, self._player,
                                    on_delete=self._delete_current,
+                                   on_rename=self._rename_current,
                                    on_stop_recording=self._stop_recording,
+                                   notepad_icon=self._notepad_icon,
+                                   copy_icon=self._copy_icon,
                                    bg=DARK_BG)
         paned.add(self._detail, minsize=400)
 
@@ -2120,6 +2253,54 @@ class MuesliApp(tk.Tk):
         meta = self._recordings[sel[0]]
         self._cur_meta = meta
         self._detail.show(meta)
+
+    def _load_detail_icon(self, path):
+        if os.path.exists(path):
+            try:
+                return tk.PhotoImage(master=self, file=path)
+            except Exception:
+                return None
+        return None
+
+    def _rename_meta(self, meta):
+        if not meta:
+            return
+        current = meta_title(meta)
+        title = simpledialog.askstring("Rename Session", "Session name", initialvalue=current, parent=self)
+        if title is None:
+            return
+        title = title.strip()
+        if not title:
+            return
+        meta["title"] = title
+        _save_meta(meta)
+        self._refresh_list()
+        for item in self._recordings:
+            if item.get("slug") == meta.get("slug"):
+                self._cur_meta = item
+                self._detail.show(item)
+                break
+        self._status_var.set("Session renamed")
+
+    def _rename_current(self):
+        self._rename_meta(self._cur_meta)
+
+    def _rename_selected_from_list(self, _event=None):
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        self._rename_meta(self._recordings[sel[0]])
+
+    def _rename_selected_on_click(self, event):
+        if not self._recordings:
+            return
+        idx = self._listbox.nearest(event.y)
+        sel = self._listbox.curselection()
+        if not sel or idx != sel[0]:
+            return
+        if not self._cur_meta or self._recordings[idx].get("slug") != self._cur_meta.get("slug"):
+            return
+        self.after(0, lambda: self._rename_meta(self._recordings[idx]))
 
     # ── Recording ─────────────────────────────────────────────────────────────
     def _toggle_recording(self):
@@ -2222,6 +2403,7 @@ class MuesliApp(tk.Tk):
             self._cur_meta = meta
             self._detail.show(meta)
             if stage == "done":
+                self._refresh_llm_warning()
                 for i, m in enumerate(self._recordings):
                     if m.get("slug") == meta.get("slug"):
                         self._listbox.selection_clear(0, "end")
@@ -2232,22 +2414,44 @@ class MuesliApp(tk.Tk):
         """Delete the currently selected recording and refresh the UI."""
         if not self._cur_meta:
             return
-        self._player.stop()
+        title = meta_title(self._cur_meta)
+        if not messagebox.askyesno("Delete Session", f"Delete “{title}”?", parent=self):
+            return
+        current_slug = self._cur_meta.get("slug")
+        current_index = 0
+        for idx, meta in enumerate(self._recordings):
+            if meta.get("slug") == current_slug:
+                current_index = idx
+                break
+        self._player.clear()
         delete_recording(self._cur_meta)
         self._cur_meta = None
-        self._detail.clear()
-        self._refresh_list()
-        self._status_var.set("Recording deleted")
+        self._recordings = list_recordings()
+        if not self._recordings:
+            self._detail.clear()
+            self._listbox.delete(0, "end")
+            self._status_var.set("Session deleted")
+            return
+        next_index = min(current_index, len(self._recordings) - 1)
+        self._redraw_labels()
+        self._listbox.selection_clear(0, "end")
+        self._listbox.selection_set(next_index)
+        self._cur_meta = self._recordings[next_index]
+        self._detail.show(self._cur_meta)
+        self._status_var.set("Session deleted")
 
 
 # ── Detail Panel ──────────────────────────────────────────────────────────────
 class DetailPanel(tk.Frame):
-    def __init__(self, parent, player, on_delete=None, on_stop_recording=None, **kw):
+    def __init__(self, parent, player, on_delete=None, on_rename=None, on_stop_recording=None, notepad_icon=None, copy_icon=None, **kw):
         super().__init__(parent, **kw)
         self._current   = None
         self._player    = player
         self._on_delete = on_delete
+        self._on_rename = on_rename
         self._on_stop_recording = on_stop_recording
+        self._notepad_icon = notepad_icon
+        self._copy_icon = copy_icon
         self._tick_id   = None
         self._duration  = 0.0
         self._live_mode = False
@@ -2270,9 +2474,18 @@ class DetailPanel(tk.Frame):
         tk.Label(c, text="Session", font=("Segoe UI Semibold", 9),
                  bg=PANEL_BG, fg=FG_DIM).pack(anchor="w")
         self._title_var = tk.StringVar()
-        tk.Label(c, textvariable=self._title_var,
-                 font=("Segoe UI Semibold", 18), bg=PANEL_BG, fg=FG,
-                 wraplength=560, justify="left").pack(anchor="w", pady=(2, 10))
+        self._title_lbl = tk.Label(
+            c,
+            textvariable=self._title_var,
+            font=("Segoe UI Semibold", 18),
+            bg=PANEL_BG,
+            fg=FG,
+            wraplength=560,
+            justify="left",
+            cursor="hand2",
+        )
+        self._title_lbl.pack(anchor="w", pady=(2, 10))
+        self._title_lbl.bind("<Button-1>", self._on_rename_click)
 
         # ── Meta row ──────────────────────────────────────────────────────
         mr = tk.Frame(c, bg=PANEL_BG)
@@ -2293,12 +2506,30 @@ class DetailPanel(tk.Frame):
         transport = tk.Frame(c, bg=PANEL_BG)
         transport.pack(anchor="w", pady=(0, 14))
 
-        btn_cfg = dict(font=("Segoe UI Symbol", 13), bg=ITEM_BG, fg=FG,
-                       activebackground=ITEM_ALT, activeforeground=FG,
-                       relief="flat", bd=1, padx=10, pady=6, cursor="hand2", highlightthickness=0)
-
-        self._play_btn = tk.Button(transport, text="▶", command=self._on_play, **btn_cfg)
-        self._stop_btn = tk.Button(transport, text="⏹", command=self._on_stop, **btn_cfg)
+        self._play_btn = RoundedButton(
+            transport,
+            text="Play",
+            command=self._on_play,
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            pad_x=12,
+            pad_y=6,
+        )
+        self._stop_btn = RoundedButton(
+            transport,
+            text="Stop",
+            command=self._on_stop,
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            pad_x=12,
+            pad_y=6,
+        )
         self._play_btn.pack(side="left", padx=(0, 4))
         self._stop_btn.pack(side="left", padx=(0, 12))
 
@@ -2321,14 +2552,31 @@ class DetailPanel(tk.Frame):
         # ── File links ────────────────────────────────────────────────────
         fr = tk.Frame(c, bg=PANEL_BG)
         fr.pack(anchor="w", pady=(0, 14))
-        self._audio_btn = self._link_btn(fr, "Open Audio", self._open_audio)
+        self._audio_btn = RoundedButton(
+            fr,
+            text="Open Audio",
+            command=self._open_audio,
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            pad_x=12,
+            pad_y=6,
+        )
         self._audio_btn.pack(side="left")
-        tk.Label(fr, text="   ", bg=PANEL_BG).pack(side="left")
-        self._del_btn = tk.Button(fr, text="Delete", font=FONT_SM,
-                                  bg=PANEL_BG, fg=RED,
-                                  activeforeground=RED, activebackground=PANEL_BG,
-                                  relief="flat", bd=0, cursor="hand2",
-                                  command=self._on_delete_click)
+        self._del_btn = RoundedButton(
+            fr,
+            text="Delete",
+            command=self._on_delete_click,
+            font=FONT_SM,
+            bg="#fee2e2",
+            fg="#991b1b",
+            active_bg="#fecaca",
+            shadow="#f5b8b8",
+            pad_x=12,
+            pad_y=6,
+        )
         self._del_btn.pack(side="left")
 
         # ── Summary ───────────────────────────────────────────────────────
@@ -2346,9 +2594,9 @@ class DetailPanel(tk.Frame):
                  bg=PANEL_BG, fg=FG_DIM).pack(side="left")
         self._open_transcript_btn = RoundedButton(
             tr_hdr,
-            text="🗒",
+            text="",
             command=self._open_transcript,
-            font=("Segoe UI Emoji", 10),
+            icon_image=self._notepad_icon,
             bg=ITEM_BG,
             fg=FG,
             active_bg=ITEM_ALT,
@@ -2363,6 +2611,7 @@ class DetailPanel(tk.Frame):
             text="Copy",
             command=self._copy_transcript,
             font=FONT_SM,
+            icon_image=self._copy_icon,
             bg=ITEM_BG,
             fg=FG,
             active_bg=ITEM_ALT,
@@ -2379,12 +2628,6 @@ class DetailPanel(tk.Frame):
                                        font=FONT_MON, padx=10, pady=8, state="disabled")
         self._transcript_txt.pack(fill="both", expand=True)
 
-    def _link_btn(self, parent, label, cmd):
-        return tk.Button(parent, text=label, font=FONT_SM,
-                         bg=PANEL_BG, fg=FG_LINK,
-                         activeforeground=FG, activebackground=PANEL_BG,
-                         relief="flat", bd=0, cursor="hand2", command=cmd)
-
     # ── Show ──────────────────────────────────────────────────────────────────
     def show_live(self):
         """Prepare the detail panel for live recording display."""
@@ -2398,9 +2641,10 @@ class DetailPanel(tk.Frame):
         self._dur_lbl.config(text="")
         self._speakers_lbl.config(text="")
         self._status_lbl.config(text="Recording...", fg=YELLOW)
-        self._play_btn.config(state="disabled")
-        self._stop_btn.config(state="normal")
-        self._audio_btn.config(state="disabled", fg=FG_DIM)
+        self._play_btn.set_enabled(False)
+        self._stop_btn.set_enabled(True)
+        self._audio_btn.set_enabled(False)
+        self._del_btn.set_enabled(False)
         self._open_transcript_btn.set_enabled(False)
         self._copy_btn.set_enabled(False)
         self._set_text(self._summary_txt, "")
@@ -2448,12 +2692,12 @@ class DetailPanel(tk.Frame):
         slug      = meta.get("slug", "")
         has_audio = _audio_exists(slug)
         has_txt   = os.path.exists(_txt_path(slug))
-        self._audio_btn.config(state="normal" if has_audio else "disabled",
-                               fg=FG_LINK if has_audio else FG_DIM)
+        self._audio_btn.set_enabled(has_audio)
+        self._del_btn.set_enabled(True)
         self._open_transcript_btn.set_enabled(has_txt)
         self._copy_btn.set_enabled(bool(meta.get("transcript", "")))
-        self._play_btn.config(state="normal" if has_audio else "disabled")
-        self._stop_btn.config(state="normal" if has_audio else "disabled")
+        self._play_btn.set_enabled(has_audio)
+        self._stop_btn.set_enabled(has_audio)
 
         if has_audio:
             self._player.load(_audio_path(slug))
@@ -2498,7 +2742,7 @@ class DetailPanel(tk.Frame):
 
     def _update_transport(self):
         state = self._player.state
-        self._play_btn.config(text="⏸" if state == "playing" else "▶")
+        self._play_btn.configure_button(text="Pause" if state == "playing" else "Play")
 
         pos = self._player.position
         self._pos_var.set(format_duration(pos) or "0:00")
@@ -2525,6 +2769,10 @@ class DetailPanel(tk.Frame):
         if self._current and self._on_delete:
             self._on_delete()
 
+    def _on_rename_click(self, _event=None):
+        if self._current and self._on_rename and not self._live_mode:
+            self._on_rename()
+
     def _copy_transcript(self):
         if not self._current:
             return
@@ -2546,6 +2794,10 @@ class DetailPanel(tk.Frame):
         self._stop_tick()
         self._content.pack_forget()
         self._placeholder.pack(expand=True)
+        self._audio_btn.set_enabled(False)
+        self._del_btn.set_enabled(False)
+        self._play_btn.set_enabled(False)
+        self._stop_btn.set_enabled(False)
         self._open_transcript_btn.set_enabled(False)
         self._copy_btn.set_enabled(False)
 

@@ -19,6 +19,8 @@ import re
 import ctypes
 import shutil
 import sys
+import urllib.request
+import urllib.error
 
 try:
     import sounddevice as sd
@@ -144,58 +146,24 @@ def _slug_from_title(title):
     return s[:60] or "recording"
 
 
+def _default_session_title(started_at):
+    try:
+        dt = datetime.datetime.fromisoformat(started_at)
+        return dt.strftime("%Y-%m-%d %I-%M %p").replace(" 0", " ")
+    except Exception:
+        return "Recording"
+
+
 def _clean_sentence(text):
     text = re.sub(r"\s+", " ", (text or "")).strip()
     return text.strip(" -,:;")
 
 
 def _fallback_ai_fields(transcript):
-    text = _clean_sentence(transcript)
-    if not text:
-        return {
-            "title": "Recording",
-            "summary": "",
-            "speakers": 1,
-            "corrections": "",
-            "bugs": "",
-        }
-
-    sentences = [
-        _clean_sentence(part)
-        for part in re.split(r"(?<=[.!?])\s+", text)
-        if _clean_sentence(part)
-    ]
-    if not sentences:
-        sentences = [text]
-
-    summary = " ".join(sentences[:2]).strip()
-    if len(summary) > 320:
-        summary = summary[:317].rstrip() + "..."
-
-    stop = {
-        "the", "and", "for", "with", "that", "this", "from", "have", "just",
-        "they", "them", "then", "into", "about", "your", "there", "will",
-        "would", "could", "should", "what", "when", "where", "which",
-    }
-    words = re.findall(r"[A-Za-z0-9']+", sentences[0])
-    title_words = []
-    for word in words:
-        lower = word.lower()
-        if lower in stop:
-            continue
-        title_words.append(word.capitalize())
-        if len(title_words) == 5:
-            break
-    if not title_words:
-        title_words = [word.capitalize() for word in words[:4]] or ["Recording"]
-
-    speaker_matches = set(re.findall(r"\b(?:speaker|spk)\s*([0-9]+)\b", text, flags=re.I))
-    speakers = max(1, len(speaker_matches))
-
     return {
-        "title": " ".join(title_words).strip() or "Recording",
-        "summary": summary,
-        "speakers": speakers,
+        "title": "",
+        "summary": "",
+        "speakers": 0,
         "corrections": "",
         "bugs": "",
     }
@@ -221,10 +189,16 @@ def _load_recording(path):
 
 def _ffmpeg_available():
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, **_subprocess_kwargs())
         return True
     except Exception:
         return False
+
+
+def _subprocess_kwargs():
+    if os.name != "nt":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
 # ── Whisper (lazy singleton) ─────────────────────────────────────────────────
@@ -342,6 +316,7 @@ def _transcribe_segments(audio_file_path, **kwargs):
 _llm_model = None
 _llm_lock = threading.Lock()
 _LLM_MODEL_DIR = os.path.join(APP_DIR, "models")
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 
 
 def _list_gguf_models():
@@ -359,6 +334,60 @@ def _selected_gguf_model_path():
     if models:
         return os.path.join(_LLM_MODEL_DIR, models[0])
     return None
+
+
+def _ollama_request(path, payload=None, timeout=3):
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"{_OLLAMA_BASE_URL}{path}", data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+    return json.loads(body) if body else {}
+
+
+def _list_ollama_models():
+    try:
+        payload = _ollama_request("/api/tags")
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return []
+    models = [m.get("name", "").strip() for m in payload.get("models", [])]
+    return [m for m in models if m]
+
+
+def _recommend_ollama_model(models):
+    if not models:
+        return None
+    lowered = {name.lower(): name for name in models}
+    for candidate in (
+        "qwen3.5:4b",
+        "qwen3.5:9b",
+        "qwen3:8b",
+        "gemma4:e4b",
+        "gemma4:4b",
+        "llama3.1:8b",
+        "mistral:7b",
+        "phi4",
+        "deepseek-r1:8b",
+    ):
+        if candidate in lowered:
+            return lowered[candidate]
+    filtered = [
+        name for name in models
+        if not any(token in name.lower() for token in ("coder", "code", "vl", "vision", "embed", "cloud"))
+    ]
+    return filtered[0] if filtered else models[0]
+
+
+def _selected_ollama_model():
+    cfg = _load_config()
+    selected = str(cfg.get("ollama_model", "")).strip()
+    models = _list_ollama_models()
+    if selected and selected in models:
+        return selected
+    return _recommend_ollama_model(models)
 
 
 def _llm_backend():
@@ -387,6 +416,7 @@ def _llm_generate(prompt_text):
     backend = _llm_backend()
     api_key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
     anthropic_allowed = backend in ("auto", "anthropic")
+    ollama_allowed = backend in ("auto", "ollama")
     local_allowed = backend in ("auto", "local")
 
     if anthropic_allowed and api_key:
@@ -404,6 +434,25 @@ def _llm_generate(prompt_text):
 
     if backend == "anthropic" and not api_key:
         raise RuntimeError("Anthropic is selected but no API key is configured")
+
+    if ollama_allowed:
+        try:
+            model_name = _selected_ollama_model()
+            if not model_name:
+                raise RuntimeError("No Ollama model is installed")
+            resp = _ollama_request(
+                "/api/generate",
+                {"model": model_name, "prompt": prompt_text, "stream": False},
+                timeout=120,
+            )
+            text = str(resp.get("response", "")).strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+    if backend == "ollama":
+        raise RuntimeError("Ollama is selected but no usable Ollama model is available")
 
     if local_allowed:
         try:
@@ -706,10 +755,11 @@ class Muesli:
         wf.writeframes(b"".join(self._frames))
         wf.close()
 
+        started_at = datetime.datetime.now().isoformat()
         meta = {
             "slug": slug,
-            "title": slug,
-            "started_at": datetime.datetime.now().isoformat(),
+            "title": _default_session_title(started_at),
+            "started_at": started_at,
             "duration": duration,
             "status": "processing",
             "summary": "",
@@ -750,6 +800,7 @@ class Muesli:
                         ["ffmpeg", "-y", "-i", wav_path,
                          "-ac", "1", "-ar", "16000", "-b:a", "64k", mp3_path],
                         capture_output=True, check=True,
+                        **_subprocess_kwargs(),
                     )
                     if os.path.exists(wav_path):
                         os.remove(wav_path)
@@ -764,6 +815,7 @@ class Muesli:
                     os.remove(wav_path)
 
         # Final summary
+        llm_used = False
         try:
             if summaries and any(summaries):
                 merged = "\n".join(f"- {s}" for s in summaries if s)
@@ -777,24 +829,28 @@ class Muesli:
             raw = re.sub(r"^```[a-z]*\n?", "", raw)
             raw = re.sub(r"\n?```$", "", raw)
             ai = json.loads(raw)
+            llm_used = True
         except Exception:
             ai = _fallback_ai_fields(transcript)
 
-        title = ai.get("title", "Recording").strip() or "Recording"
-        summary = ai.get("summary", "")
-        speakers = int(ai.get("speakers", 1))
+        default_title = _default_session_title(meta.get("started_at", ""))
+        title = ai.get("title", "").strip() or default_title
+        summary = ai.get("summary", "").strip() if llm_used else ""
+        speakers = int(ai.get("speakers", 0) or 0) if llm_used else 0
         corrections = ai.get("corrections", "")
         bugs = ai.get("bugs", "")
 
-        # Build final slug from title
-        new_slug = _slug_from_title(title)
-        candidate = new_slug
-        i = 2
-        while (os.path.exists(os.path.join(REC_DIR, candidate + ".json"))
-               and candidate != slug):
-            candidate = f"{new_slug}-{i}"
-            i += 1
-        new_slug = candidate
+        # Only rename files when an LLM supplied a real title.
+        new_slug = slug
+        if llm_used and title:
+            base_slug = _slug_from_title(title)
+            candidate = base_slug
+            i = 2
+            while (os.path.exists(os.path.join(REC_DIR, candidate + ".json"))
+                   and candidate != slug):
+                candidate = f"{base_slug}-{i}"
+                i += 1
+            new_slug = candidate
 
         # Rename audio if slug changed
         if new_slug != slug:
@@ -807,7 +863,9 @@ class Muesli:
 
         # Write markdown transcript
         txt_path = os.path.join(self._shared_dir, new_slug + ".txt")
-        txt_body = f"# {title}\n\n## Summary\n\n{summary}\n\n"
+        txt_body = f"# {title}\n\n"
+        if summary:
+            txt_body += f"## Summary\n\n{summary}\n\n"
         if corrections:
             txt_body += f"## Transcription Corrections\n\n{corrections}\n\n"
         if bugs:
@@ -865,10 +923,11 @@ class Muesli:
         # Get duration via ffprobe if available
         duration = self._probe_duration(audio_file_path)
 
+        started_at = datetime.datetime.now().isoformat()
         meta = {
             "slug": slug,
-            "title": slug,
-            "started_at": datetime.datetime.now().isoformat(),
+            "title": _default_session_title(started_at),
+            "started_at": started_at,
             "duration": duration,
             "status": "processing",
             "summary": "",
@@ -896,6 +955,7 @@ class Muesli:
                 ["ffprobe", "-v", "quiet", "-show_entries",
                  "format=duration", "-of", "csv=p=0", path],
                 capture_output=True, text=True, check=True,
+                **_subprocess_kwargs(),
             )
             return float(r.stdout.strip())
         except Exception:
