@@ -103,6 +103,12 @@ def _hotkey_agent_target():
     return pythonw, f'"{HOTKEY_AGENT_SCRIPT}"'
 
 
+def _hidden_subprocess_kwargs():
+    if not IS_WIN:
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
 def restart_windows_hotkey_agent():
     if not IS_WIN or not os.path.exists(HOTKEY_AGENT_SCRIPT):
         return
@@ -119,6 +125,7 @@ def restart_windows_hotkey_agent():
             check=False,
             capture_output=True,
             timeout=10,
+            **_hidden_subprocess_kwargs(),
         )
         time.sleep(0.3)
     except Exception:
@@ -135,6 +142,7 @@ def restart_windows_hotkey_agent():
                 check=False,
                 capture_output=True,
                 timeout=5,
+                **_hidden_subprocess_kwargs(),
             )
             time.sleep(0.2)
         except Exception:
@@ -178,7 +186,12 @@ $s.Description = '{description}'
             ps += "$s.Hotkey = ''\n"
         ps += "$s.Save()"
         try:
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True, capture_output=True)
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                check=True,
+                capture_output=True,
+                **_hidden_subprocess_kwargs(),
+            )
         except Exception:
             return
 
@@ -197,6 +210,14 @@ $s.Description = '{description}'
     except Exception:
         pass
     restart_windows_hotkey_agent()
+
+
+def ensure_windows_shortcuts_if_missing():
+    if not IS_WIN:
+        return
+    required = (DESKTOP_SHORTCUT, RECORD_SHORTCUT, HOTKEY_AGENT_SHORTCUT)
+    if any(not os.path.exists(path) for path in required):
+        ensure_windows_shortcuts()
 
 
 def capture_hotkey(master, initial_value):
@@ -954,19 +975,21 @@ class Player:
 
 
 # ── GUI constants ─────────────────────────────────────────────────────────────
-DARK_BG  = "#1e1e1e"
-PANEL_BG = "#252526"
-ITEM_BG  = "#2d2d30"
-ITEM_SEL = "#094771"
-FG       = "#d4d4d4"
-FG_DIM   = "#858585"
-FG_LINK  = "#4fc1ff"
-RED      = "#f44747"
-GREEN    = "#4ec9b0"
-YELLOW   = "#dcdcaa"
-FONT_SM  = ("Ubuntu", 9)
-FONT_LG  = ("Ubuntu", 13, "bold")
-FONT_MON = ("Ubuntu Mono", 10)
+DARK_BG  = "#f3f4f6"
+PANEL_BG = "#fbfbfd"
+ITEM_BG  = "#ffffff"
+ITEM_SEL = "#dceafe"
+FG       = "#111827"
+FG_DIM   = "#6b7280"
+FG_LINK  = "#2563eb"
+RED      = "#d14343"
+GREEN    = "#2563eb"
+YELLOW   = "#b7791f"
+LINE     = "#e5e7eb"
+ITEM_ALT = "#eef2f7"
+FONT_SM  = ("Segoe UI", 9)
+FONT_LG  = ("Segoe UI Semibold", 16)
+FONT_MON = ("Consolas", 10)
 
 # ── Microphone icon (pixel art) ──────────────────────────────────────────────
 # 48×48 bitmap: '.' = transparent, 'X' = foreground
@@ -1074,11 +1097,11 @@ class MuesliApp(tk.Tk):
         self._live_transcript = ""   # accumulated transcript during recording
         self._resume_progress = {}   # slug -> "transcribing 45%" for list labels
 
-        # Taskbar icons — green (idle) and red (recording)
+        # Taskbar icons — idle and recording states
         self._icon_idle = _load_app_icon(self)
         self._icon_rec  = self._icon_idle
         self.wm_iconphoto(True, self._icon_idle)
-        ensure_windows_shortcuts()
+        ensure_windows_shortcuts_if_missing()
 
         self._build_ui()
         self._cleanup_stale()
@@ -1087,7 +1110,7 @@ class MuesliApp(tk.Tk):
         # Listen for commands from second instances (single-instance pattern)
         self._start_ipc_listener()
         # Resume interrupted recordings in background
-        self._status_var.set("Starting…")
+        self._status_var.set("Starting...")
         threading.Thread(target=self._startup_background, daemon=True).start()
         # Auto-start recording if launched with --record
         if "--record" in sys.argv:
@@ -1272,36 +1295,41 @@ class MuesliApp(tk.Tk):
     # ── Layout ────────────────────────────────────────────────────────────────
     def _build_ui(self):
         # Top bar
-        top = tk.Frame(self, bg=DARK_BG, pady=8, padx=12)
+        top = tk.Frame(self, bg=DARK_BG, pady=14, padx=18)
         top.pack(fill="x")
-        tk.Label(top, text="⬤  Muesli", font=FONT_LG,
-                 bg=DARK_BG, fg=GREEN).pack(side="left")
+        tk.Label(
+            top,
+            text="Muesli",
+            font=FONT_LG,
+            bg=DARK_BG,
+            fg=FG,
+        ).pack(side="left")
         self._rec_btn = tk.Button(
-            top, text="  ● Start Recording  ",
-            font=("Ubuntu", 11, "bold"),
-            bg=RED, fg="white", activebackground="#c53030",
-            relief="flat", padx=16, pady=6, cursor="hand2",
+            top, text="Start Recording",
+            font=("Segoe UI Semibold", 10),
+            bg=RED, fg="white", activebackground="#b42318",
+            relief="flat", bd=0, padx=18, pady=9, cursor="hand2",
             command=self._toggle_recording
         )
         self._rec_btn.pack(side="right")
         if not self._recording_available:
-            self._rec_btn.config(state="disabled", bg="#555555", activebackground="#555555")
+            self._rec_btn.config(state="disabled", bg="#cbd5e1", fg="#64748b", activebackground="#cbd5e1")
         tk.Button(
-            top, text="✎ Prompt", font=FONT_SM,
-            bg=DARK_BG, fg=FG_DIM,
-            activeforeground="white", activebackground=DARK_BG,
-            relief="flat", bd=0, padx=8, cursor="hand2",
+            top, text="Edit Prompt", font=FONT_SM,
+            bg=ITEM_BG, fg=FG,
+            activeforeground=FG, activebackground=ITEM_ALT,
+            relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
             command=self._edit_prompt
         ).pack(side="right", padx=(0, 10))
         tk.Button(
             top, text="Set Shortcut", font=FONT_SM,
-            bg=DARK_BG, fg=FG_DIM,
-            activeforeground="white", activebackground=DARK_BG,
-            relief="flat", bd=0, padx=8, cursor="hand2",
+            bg=ITEM_BG, fg=FG,
+            activeforeground=FG, activebackground=ITEM_ALT,
+            relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
             command=self._set_shortcut
         ).pack(side="right", padx=(0, 10))
         self._timer_lbl = tk.Label(top, text="",
-                                   font=("Ubuntu Mono", 12, "bold"),
+                                   font=("Consolas", 12, "bold"),
                                    bg=DARK_BG, fg=RED)
         self._timer_lbl.pack(side="right", padx=12)
 
@@ -1309,30 +1337,31 @@ class MuesliApp(tk.Tk):
         initial_status = "Ready" if self._recording_available else "Ready (recording backend unavailable)"
         self._status_var = tk.StringVar(value=initial_status)
         tk.Label(self, textvariable=self._status_var, font=FONT_SM,
-                 bg=DARK_BG, fg=FG_DIM, anchor="w", padx=12).pack(fill="x")
-        tk.Frame(self, bg="#3c3c3c", height=1).pack(fill="x")
+                 bg=DARK_BG, fg=FG_DIM, anchor="w", padx=18).pack(fill="x", pady=(0, 8))
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x")
 
         # Main split — draggable PanedWindow
         paned = tk.PanedWindow(self, orient="horizontal",
-                               bg="#3c3c3c", sashwidth=4, sashpad=0,
+                               bg=LINE, sashwidth=4, sashpad=0,
                                bd=0, relief="flat")
         paned.pack(fill="both", expand=True)
 
         # Left list
-        left = tk.Frame(paned, bg=PANEL_BG, width=270)
+        left = tk.Frame(paned, bg=PANEL_BG, width=290)
         left.pack_propagate(False)
-        tk.Label(left, text="SESSIONS", font=("Ubuntu", 8, "bold"),
+        tk.Label(left, text="Sessions", font=("Segoe UI Semibold", 9),
                  bg=PANEL_BG, fg=FG_DIM, anchor="w",
-                 padx=10, pady=8).pack(fill="x")
+                 padx=16, pady=14).pack(fill="x")
 
         lf = tk.Frame(left, bg=PANEL_BG)
         lf.pack(fill="both", expand=True)
-        sb = tk.Scrollbar(lf, bg=PANEL_BG, troughcolor=PANEL_BG, relief="flat")
+        sb = tk.Scrollbar(lf, bg=PANEL_BG, troughcolor=ITEM_ALT, relief="flat")
         sb.pack(side="right", fill="y")
         self._listbox = tk.Listbox(
             lf, bg=PANEL_BG, fg=FG,
             selectbackground=ITEM_SEL, selectforeground="white",
-            font=FONT_SM, relief="flat", bd=0, activestyle="none",
+            font=("Segoe UI", 9), relief="flat", bd=0, activestyle="none",
+            highlightthickness=0,
             yscrollcommand=sb.set, cursor="hand2"
         )
         self._listbox.pack(fill="both", expand=True)
@@ -1400,8 +1429,23 @@ class MuesliApp(tk.Tk):
         return label
 
     def _refresh_list(self):
+        selected_slug = self._cur_meta.get("slug") if self._cur_meta else None
         self._recordings = list_recordings()
         self._redraw_labels()
+        if not self._recordings:
+            self._cur_meta = None
+            self._detail.clear()
+            return
+        selected_idx = 0
+        if selected_slug:
+            for idx, meta in enumerate(self._recordings):
+                if meta.get("slug") == selected_slug:
+                    selected_idx = idx
+                    break
+        self._listbox.selection_clear(0, "end")
+        self._listbox.selection_set(selected_idx)
+        self._cur_meta = self._recordings[selected_idx]
+        self._detail.show(self._cur_meta)
 
     def _on_select(self, _e):
         sel = self._listbox.curselection()
@@ -1430,10 +1474,14 @@ class MuesliApp(tk.Tk):
                     f"Recording… ({nn} chunk{'s' if nn != 1 else ''} processed)"))
         )
         self._recorder.start(on_chunk=self._chunk_pipeline.submit)
-        self._rec_btn.config(text="  ■ Stop Recording  ",
-                             bg="#333333", fg=RED)
+        self._rec_btn.config(
+            text="Stop Recording",
+            bg="#111827",
+            fg="white",
+            activebackground="#1f2937",
+        )
         self.wm_iconphoto(True, self._icon_rec)
-        self._status_var.set("Recording…")
+        self._status_var.set("Recording...")
         # Show the detail panel immediately for live transcript display
         self._detail.show_live()
         self._tick_timer()
@@ -1457,9 +1505,14 @@ class MuesliApp(tk.Tk):
         self._recording = False
         if self._timer_id: self.after_cancel(self._timer_id)
         self._timer_lbl.config(text="")
-        self._rec_btn.config(text="  ● Start Recording  ", bg=RED, fg="white")
+        self._rec_btn.config(
+            text="Start Recording",
+            bg=RED,
+            fg="white",
+            activebackground="#b42318",
+        )
         self.wm_iconphoto(True, self._icon_idle)
-        self._status_var.set("Finishing processing…")
+        self._status_var.set("Finishing processing...")
         self.update_idletasks()
 
         meta = self._recorder.stop()
@@ -1531,31 +1584,34 @@ class DetailPanel(tk.Frame):
 
     def _build(self):
         self._placeholder = tk.Label(
-            self, text="Select a session to view details",
-            font=FONT_SM, bg=DARK_BG, fg=FG_DIM
+            self,
+            text="Select a session to review the transcript and summary",
+            font=("Segoe UI", 10),
+            bg=PANEL_BG,
+            fg=FG_DIM,
         )
         self._placeholder.pack(expand=True)
 
-        c = tk.Frame(self, bg=DARK_BG, padx=24, pady=18)
+        c = tk.Frame(self, bg=PANEL_BG, padx=24, pady=20)
         self._content = c
 
         # ── Title ─────────────────────────────────────────────────────────
-        tk.Label(c, text="SESSION", font=("Ubuntu", 8, "bold"),
-                 bg=DARK_BG, fg=FG_DIM).pack(anchor="w")
+        tk.Label(c, text="Session", font=("Segoe UI Semibold", 9),
+                 bg=PANEL_BG, fg=FG_DIM).pack(anchor="w")
         self._title_var = tk.StringVar()
         tk.Label(c, textvariable=self._title_var,
-                 font=("Ubuntu", 15, "bold"), bg=DARK_BG, fg=FG,
+                 font=("Segoe UI Semibold", 18), bg=PANEL_BG, fg=FG,
                  wraplength=560, justify="left").pack(anchor="w", pady=(2, 10))
 
         # ── Meta row ──────────────────────────────────────────────────────
-        mr = tk.Frame(c, bg=DARK_BG)
+        mr = tk.Frame(c, bg=PANEL_BG)
         mr.pack(anchor="w", pady=(0, 14))
-        self._date_lbl     = tk.Label(mr, font=FONT_SM, bg=DARK_BG, fg=FG_DIM)
-        self._age_lbl      = tk.Label(mr, font=FONT_SM, bg=DARK_BG, fg=FG_DIM)
-        self._dur_lbl      = tk.Label(mr, font=FONT_SM, bg=DARK_BG, fg=FG_DIM)
-        self._speakers_lbl = tk.Label(mr, font=FONT_SM, bg=DARK_BG, fg=FG_DIM)
-        self._status_lbl   = tk.Label(mr, font=FONT_SM, bg=DARK_BG, fg=YELLOW)
-        dot = lambda: tk.Label(mr, text=" · ", bg=DARK_BG, fg=FG_DIM, font=FONT_SM)
+        self._date_lbl     = tk.Label(mr, font=FONT_SM, bg=PANEL_BG, fg=FG_DIM)
+        self._age_lbl      = tk.Label(mr, font=FONT_SM, bg=PANEL_BG, fg=FG_DIM)
+        self._dur_lbl      = tk.Label(mr, font=FONT_SM, bg=PANEL_BG, fg=FG_DIM)
+        self._speakers_lbl = tk.Label(mr, font=FONT_SM, bg=PANEL_BG, fg=FG_DIM)
+        self._status_lbl   = tk.Label(mr, font=FONT_SM, bg=PANEL_BG, fg=YELLOW)
+        dot = lambda: tk.Label(mr, text=" · ", bg=PANEL_BG, fg=FG_DIM, font=FONT_SM)
         self._date_lbl.pack(side="left")
         dot().pack(side="left"); self._age_lbl.pack(side="left")
         dot().pack(side="left"); self._dur_lbl.pack(side="left")
@@ -1563,12 +1619,12 @@ class DetailPanel(tk.Frame):
         dot().pack(side="left"); self._status_lbl.pack(side="left")
 
         # ── Transport controls ────────────────────────────────────────────
-        transport = tk.Frame(c, bg=DARK_BG)
+        transport = tk.Frame(c, bg=PANEL_BG)
         transport.pack(anchor="w", pady=(0, 14))
 
-        btn_cfg = dict(font=("Ubuntu", 14), bg=ITEM_BG, fg=FG,
-                       activebackground="#3a3a3d", activeforeground="white",
-                       relief="flat", bd=0, padx=10, pady=4, cursor="hand2")
+        btn_cfg = dict(font=("Segoe UI Symbol", 13), bg=ITEM_BG, fg=FG,
+                       activebackground=ITEM_ALT, activeforeground=FG,
+                       relief="flat", bd=1, padx=10, pady=6, cursor="hand2", highlightthickness=0)
 
         self._play_btn = tk.Button(transport, text="▶", command=self._on_play, **btn_cfg)
         self._stop_btn = tk.Button(transport, text="⏹", command=self._on_stop, **btn_cfg)
@@ -1577,65 +1633,65 @@ class DetailPanel(tk.Frame):
 
         self._pos_var = tk.StringVar(value="0:00")
         tk.Label(transport, textvariable=self._pos_var,
-                 font=("Ubuntu Mono", 10), bg=DARK_BG, fg=FG_DIM).pack(side="left")
+                 font=("Consolas", 10), bg=PANEL_BG, fg=FG_DIM).pack(side="left")
         tk.Label(transport, text=" / ", font=FONT_SM,
-                 bg=DARK_BG, fg=FG_DIM).pack(side="left")
+                 bg=PANEL_BG, fg=FG_DIM).pack(side="left")
         self._dur_play_var = tk.StringVar(value="0:00")
         tk.Label(transport, textvariable=self._dur_play_var,
-                 font=("Ubuntu Mono", 10), bg=DARK_BG, fg=FG_DIM).pack(side="left")
+                 font=("Consolas", 10), bg=PANEL_BG, fg=FG_DIM).pack(side="left")
 
         # Progress bar (Canvas)
         self._bar_canvas = tk.Canvas(transport, height=4, width=200,
-                                     bg="#3c3c3c", bd=0, highlightthickness=0)
+                                     bg=LINE, bd=0, highlightthickness=0)
         self._bar_canvas.pack(side="left", padx=(14, 0), pady=6)
         self._bar_fill = self._bar_canvas.create_rectangle(
             0, 0, 0, 4, fill=GREEN, outline="")
 
         # ── File links ────────────────────────────────────────────────────
-        fr = tk.Frame(c, bg=DARK_BG)
+        fr = tk.Frame(c, bg=PANEL_BG)
         fr.pack(anchor="w", pady=(0, 14))
-        self._audio_btn = self._link_btn(fr, "🔊 open in player", self._open_audio)
+        self._audio_btn = self._link_btn(fr, "Open Audio", self._open_audio)
         self._audio_btn.pack(side="left")
-        tk.Label(fr, text="   ", bg=DARK_BG).pack(side="left")
-        self._txt_btn = self._link_btn(fr, "📄 open transcript", self._open_transcript)
+        tk.Label(fr, text="   ", bg=PANEL_BG).pack(side="left")
+        self._txt_btn = self._link_btn(fr, "Open Transcript", self._open_transcript)
         self._txt_btn.pack(side="left")
-        tk.Label(fr, text="   ", bg=DARK_BG).pack(side="left")
-        self._del_btn = tk.Button(fr, text="🗑 delete", font=FONT_SM,
-                                  bg=DARK_BG, fg=RED,
-                                  activeforeground="white", activebackground=DARK_BG,
+        tk.Label(fr, text="   ", bg=PANEL_BG).pack(side="left")
+        self._del_btn = tk.Button(fr, text="Delete", font=FONT_SM,
+                                  bg=PANEL_BG, fg=RED,
+                                  activeforeground=RED, activebackground=PANEL_BG,
                                   relief="flat", bd=0, cursor="hand2",
                                   command=self._on_delete_click)
         self._del_btn.pack(side="left")
 
         # ── Summary ───────────────────────────────────────────────────────
-        tk.Label(c, text="SUMMARY", font=("Ubuntu", 8, "bold"),
-                 bg=DARK_BG, fg=FG_DIM).pack(anchor="w", pady=(4, 2))
+        tk.Label(c, text="Summary", font=("Segoe UI Semibold", 9),
+                 bg=PANEL_BG, fg=FG_DIM).pack(anchor="w", pady=(4, 2))
         self._summary_txt = tk.Text(c, height=4, wrap="word",
                                     bg=ITEM_BG, fg=FG, relief="flat", bd=0,
-                                    font=FONT_SM, padx=8, pady=6, state="disabled")
+                                    font=("Segoe UI", 10), padx=10, pady=8, state="disabled")
         self._summary_txt.pack(fill="x", pady=(0, 12))
 
         # ── Transcript ────────────────────────────────────────────────────
-        tr_hdr = tk.Frame(c, bg=DARK_BG)
+        tr_hdr = tk.Frame(c, bg=PANEL_BG)
         tr_hdr.pack(fill="x", pady=(0, 2))
-        tk.Label(tr_hdr, text="TRANSCRIPT", font=("Ubuntu", 8, "bold"),
-                 bg=DARK_BG, fg=FG_DIM).pack(side="left")
+        tk.Label(tr_hdr, text="Transcript", font=("Segoe UI Semibold", 9),
+                 bg=PANEL_BG, fg=FG_DIM).pack(side="left")
         self._copy_btn = tk.Button(
-            tr_hdr, text="📋", font=("Ubuntu", 9),
-            bg=DARK_BG, fg=FG_DIM,
-            activeforeground="white", activebackground=DARK_BG,
+            tr_hdr, text="Copy", font=FONT_SM,
+            bg=PANEL_BG, fg=FG_LINK,
+            activeforeground=FG, activebackground=PANEL_BG,
             relief="flat", bd=0, padx=4, cursor="hand2",
             command=self._copy_transcript)
         self._copy_btn.pack(side="left", padx=(6, 0))
         self._transcript_txt = tk.Text(c, height=10, wrap="word",
                                        bg=ITEM_BG, fg=FG, relief="flat", bd=0,
-                                       font=FONT_MON, padx=8, pady=6, state="disabled")
+                                       font=FONT_MON, padx=10, pady=8, state="disabled")
         self._transcript_txt.pack(fill="both", expand=True)
 
     def _link_btn(self, parent, label, cmd):
         return tk.Button(parent, text=label, font=FONT_SM,
-                         bg=DARK_BG, fg=FG_LINK,
-                         activeforeground="white", activebackground=DARK_BG,
+                         bg=PANEL_BG, fg=FG_LINK,
+                         activeforeground=FG, activebackground=PANEL_BG,
                          relief="flat", bd=0, cursor="hand2", command=cmd)
 
     # ── Show ──────────────────────────────────────────────────────────────────
@@ -1644,12 +1700,12 @@ class DetailPanel(tk.Frame):
         self._current = None
         self._placeholder.pack_forget()
         self._content.pack(fill="both", expand=True)
-        self._title_var.set("Recording…")
+        self._title_var.set("Recording in progress")
         self._date_lbl.config(text="")
         self._age_lbl.config(text="")
         self._dur_lbl.config(text="")
         self._speakers_lbl.config(text="")
-        self._status_lbl.config(text="⟳ recording…", fg=YELLOW)
+        self._status_lbl.config(text="Recording...", fg=YELLOW)
         self._play_btn.config(state="disabled")
         self._stop_btn.config(state="disabled")
         self._audio_btn.config(state="disabled", fg=FG_DIM)
@@ -1690,7 +1746,7 @@ class DetailPanel(tk.Frame):
             text=f"{spk} speaker{'s' if spk != 1 else ''}" if spk else "")
 
         status = meta.get("status", "")
-        st_map = {"done": "✓ done", "processing": "⟳ processing…", "error": "✗ error"}
+        st_map = {"done": "Ready", "processing": "Processing...", "error": "Error"}
         sc_map = {"done": GREEN, "error": RED}
         self._status_lbl.config(text=st_map.get(status, status),
                                 fg=sc_map.get(status, YELLOW))

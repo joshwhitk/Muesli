@@ -1,6 +1,7 @@
 # Muesli
 
 Muesli is a local-first audio recorder, transcription app, and batch transcription tool.
+It is inspired by Granola's workflow, but it is not a full Granola clone.
 
 It can:
 
@@ -11,6 +12,8 @@ It can:
 - write sidecar `.txt` and `.silent` files for downstream tooling
 
 The current repo is Windows-first, but the core Python code also runs on Linux with the right audio and model dependencies.
+
+![Muesli screenshot](assets/muesli-screenshot.png)
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -35,6 +38,31 @@ The project is usable, but it is still a working tool rather than a polished pac
 - The batch transcription workflow is production-useful.
 - The GUI and launcher path are functional, but still evolving.
 - There is no installer package or release build in this repo yet.
+- The app intentionally focuses on local recording, local transcription, and shared-folder workflows instead of trying to match Granola feature-for-feature.
+
+## Granola Comparison
+
+This project borrows some UX and workflow ideas from Granola, but it is narrower in scope. Granola's current product includes calendar-aware meeting capture, templates, recipes, workspaces, integrations, and mobile sync. Muesli currently focuses on local recording, local transcription, local summaries, and file-based batch processing.
+
+The table below is based on Granola's public docs for [transcription](https://docs.granola.ai/help-center/taking-notes/transcription), [calendar sync](https://docs.granola.ai/help-center/getting-started/syncing-your-calendars), [templates](https://docs.granola.ai/help-center/taking-notes/customise-notes-with-templates), [recipes](https://docs.granola.ai/help-center/getting-more-from-your-notes/recipes), [workspaces](https://docs.granola.ai/help-center/workspaces), [integrations](https://docs.granola.ai/help-center/sharing/integrations/integrations-with-granola), and [iPhone sync](https://docs.granola.ai/help-center/ios/syncing-with-desktop).
+
+| Feature | Granola | Muesli | Notes |
+| --- | --- | --- | --- |
+| Local desktop recorder | Yes | Yes | Both have a desktop capture workflow. |
+| Live transcript view | Yes | Partial | Muesli shows live transcript while recording, but its UX is simpler. |
+| Mic + system audio capture separation | Yes | No | Granola distinguishes your mic from system audio on desktop. Muesli is mic-first and batch-file oriented today. |
+| Calendar-aware upcoming meetings | Yes | No | Granola syncs Google and Outlook calendars. Muesli does not. |
+| Quick ad-hoc notes | Yes | Yes | Granola has Quick Note; Muesli can start a manual recording immediately. |
+| AI-enhanced notes / summaries | Yes | Yes | Muesli can summarize locally with GGUF or via optional API fallback, but Granola's note-generation workflow is more advanced. |
+| Template-based note regeneration | Yes | No | Granola supports desktop templates and re-generation. Muesli currently uses a single editable prompt. |
+| Saved prompt recipes / chat over notes | Yes | No | Granola exposes recipes and cross-note chat. Muesli does not yet. |
+| Shared workspaces and folders | Yes | No | Muesli currently uses filesystem conventions rather than multi-user workspaces. |
+| Web sharing and collaboration | Yes | No | Granola supports shared links and folder collaboration. |
+| Integrations (Slack, Notion, CRM, Zapier, MCP, API) | Yes | No | Muesli currently integrates through files and scripts rather than productized SaaS integrations. |
+| iPhone capture and desktop sync | Yes | No | Muesli is desktop-only today. |
+| Local batch transcription from shared folders | No | Yes | This is one of Muesli's strongest workflows. |
+| Sidecar transcript and no-speech markers | No | Yes | Muesli writes `.txt` and `.silent` files for race-free downstream processing. |
+| Fully local audio retention | Partial | Yes | Granola states it uses a transcription provider and does not save audio. Muesli keeps audio and transcripts locally under your control. |
 
 ## Features
 
