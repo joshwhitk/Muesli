@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="22" stdDeviation="18" flood-color="#0d4a50" flood-opacity="0.28"/>
+    </filter>
+    <linearGradient id="ivory" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fff8ef"/>
+      <stop offset="100%" stop-color="#efe4d2"/>
+    </linearGradient>
+    <linearGradient id="grain" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f4ba49"/>
+      <stop offset="100%" stop-color="#dd8e1e"/>
+    </linearGradient>
+    <style>
+      .ivory { fill: url(#ivory); stroke: #114e55; stroke-width: 24; stroke-linecap: round; stroke-linejoin: round; }
+      .grain { fill: url(#grain); stroke: #b97519; stroke-width: 12; stroke-linecap: round; stroke-linejoin: round; }
+      .line { fill: none; stroke: #114e55; stroke-width: 28; stroke-linecap: round; stroke-linejoin: round; }
+      .cut { stroke: #114e55; stroke-width: 28; stroke-linecap: round; }
+    </style>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <path class="ivory" d="M512 120c100 0 182 82 182 182v164H330V302c0-100 82-182 182-182Z"/>
+    <path class="cut" d="M392 320h104"/>
+    <path class="cut" d="M392 398h104"/>
+    <path class="cut" d="M392 476h104"/>
+    <path class="cut" d="M632 320H528"/>
+    <path class="cut" d="M632 398H528"/>
+    <path class="cut" d="M632 476H528"/>
+
+    <path class="ivory" d="M304 554h416c0 156-92 246-208 246s-208-90-208-246Z"/>
+    <path class="line" d="M286 478v138c0 135 91 244 226 273v69"/>
+    <path class="line" d="M738 478v138c0 135-91 244-226 273"/>
+    <path class="line" d="M390 958h244"/>
+
+    <path class="grain" d="M446 678c-42-6-88-40-109-90 47-7 92 19 109 90Z"/>
+    <path class="grain" d="M512 704c-36-34-49-89-24-139 39 28 55 83 24 139Z"/>
+    <path class="grain" d="M578 678c17-71 62-97 109-90-21 50-67 84-109 90Z"/>
+    <path class="grain" d="M468 790c-70 18-112-7-142-55 46-16 96 0 142 55Z"/>
+    <path class="grain" d="M556 790c46-55 96-71 142-55-30 48-72 73-142 55Z"/>
+  </g>
+</svg>

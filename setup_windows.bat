@@ -50,46 +50,11 @@ if errorlevel 1 (
 )
 
 echo.
-echo === Creating desktop shortcut ===
-powershell -NoProfile -Command ^
-  "$root = [System.IO.Path]::GetFullPath('%~dp0'); ^
-   $ws = New-Object -ComObject WScript.Shell; ^
-   $s  = $ws.CreateShortcut([System.IO.Path]::Combine($ws.SpecialFolders('Desktop'), 'Muesli.lnk')); ^
-   $s.TargetPath   = [System.IO.Path]::Combine($root, '.venv\Scripts\pythonw.exe'); ^
-   $s.Arguments    = '\"' + [System.IO.Path]::Combine($root, 'muesli_gui.py') + '\"'; ^
-   $s.WorkingDirectory = $root; ^
-   $icon = [System.IO.Path]::Combine($root, 'assets\muesli-icon.ico'); ^
-   if ([System.IO.File]::Exists($icon)) { $s.IconLocation = $icon } ^
-   else { $s.IconLocation = 'shell32.dll,168' } ^
-   $s.Description  = 'Muesli'; ^
-   $s.Save()"
-
-powershell -NoProfile -Command ^
-  "$root = [System.IO.Path]::GetFullPath('%~dp0'); ^
-   $programs = [Environment]::GetFolderPath('Programs'); ^
-   $ws = New-Object -ComObject WScript.Shell; ^
-   $s = $ws.CreateShortcut([System.IO.Path]::Combine($programs, 'Muesli Record.lnk')); ^
-   $s.TargetPath = [System.IO.Path]::Combine($root, '.venv\Scripts\pythonw.exe'); ^
-   $s.Arguments = '\"' + [System.IO.Path]::Combine($root, 'muesli_gui.py') + '\" --record'; ^
-   $s.WorkingDirectory = $root; ^
-   $icon = [System.IO.Path]::Combine($root, 'assets\muesli-icon.ico'); ^
-   if ([System.IO.File]::Exists($icon)) { $s.IconLocation = $icon; } ^
-   $s.Description = 'Muesli Record'; ^
-   $s.Hotkey = ''; ^
-   $s.Save()"
-
-powershell -NoProfile -Command ^
-  "$root = [System.IO.Path]::GetFullPath('%~dp0'); ^
-   $startup = [Environment]::GetFolderPath('Startup'); ^
-   $ws = New-Object -ComObject WScript.Shell; ^
-   $s = $ws.CreateShortcut([System.IO.Path]::Combine($startup, 'Muesli Hotkey.lnk')); ^
-   $s.TargetPath = [System.IO.Path]::Combine($root, '.venv\Scripts\pythonw.exe'); ^
-   $s.Arguments = '\"' + [System.IO.Path]::Combine($root, 'muesli_hotkey.py') + '\"'; ^
-   $s.WorkingDirectory = $root; ^
-   $icon = [System.IO.Path]::Combine($root, 'assets\muesli-icon.ico'); ^
-   if ([System.IO.File]::Exists($icon)) { $s.IconLocation = $icon; } ^
-   $s.Description = 'Muesli Hotkey (Ctrl+Shift+`)'; ^
-   $s.Save()"
+echo === Creating or refreshing Windows shortcuts ===
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh_windows_shortcuts.ps1"
+if errorlevel 1 (
+    echo WARNING: Windows shortcuts could not be refreshed automatically.
+)
 
 echo.
 echo Setup complete. Run Muesli.lnk on your desktop, or: .venv\Scripts\python.exe muesli_gui.py

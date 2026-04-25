@@ -260,6 +260,7 @@ outputs/                    batch outputs and sidecar mirror (not committed)
 - Add a simple transcription progress diagram in the session view
 - Fix speaker counting for multi-speaker clips such as "I guess I'm going to"
 - Add clearer Ollama runtime visibility in-app so users can tell when background GPU usage comes from Muesli-driven summaries
+- Show a blinking red recording dot over the Muesli logo in visible recording-state icons, starting with the tray icon and then desktop/taskbar assets where practical
 
 ## Documentation
 

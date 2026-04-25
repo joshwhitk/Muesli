@@ -19,8 +19,10 @@ import re
 import ctypes
 import shutil
 import sys
+import importlib.util
 import urllib.request
 import urllib.error
+import uuid
 
 try:
     import sounddevice as sd
@@ -36,8 +38,14 @@ PROMPT_FILE = os.path.join(APP_DIR, "prompt.txt")
 RATE     = 16000
 CHANNELS = 1
 CHUNK    = 1024
-
-_READS_PER_CHUNK = int(30 * RATE / CHUNK)  # ~30s of audio per chunk
+LIVE_CHUNK_SECONDS = 10
+OPENAI_TRANSCRIPTION_DEFAULT_MODEL = "gpt-4o-transcribe"
+OPENAI_TRANSCRIPTION_MODELS = (
+    OPENAI_TRANSCRIPTION_DEFAULT_MODEL,
+    "gpt-4o-mini-transcribe",
+)
+OPENAI_TRANSCRIPTION_TIMEOUT_SEC = 900
+_READS_PER_CHUNK = int(LIVE_CHUNK_SECONDS * RATE / CHUNK)
 
 os.makedirs(REC_DIR, exist_ok=True)
 
@@ -94,8 +102,23 @@ def _normalize_config(cfg):
     whisper_device = str(normalized.get("whisper_device", "auto")).lower()
     normalized["whisper_device"] = whisper_device if whisper_device in ("auto", "cpu", "cuda") else "auto"
 
+    transcription_backend = str(normalized.get("transcription_backend", "local")).lower()
+    normalized["transcription_backend"] = transcription_backend if transcription_backend in ("local", "openai", "openai_realtime") else "local"
+    openai_model = str(normalized.get("openai_transcription_model", OPENAI_TRANSCRIPTION_DEFAULT_MODEL)).strip()
+    normalized["openai_transcription_model"] = openai_model if openai_model in OPENAI_TRANSCRIPTION_MODELS else OPENAI_TRANSCRIPTION_DEFAULT_MODEL
+    normalized["openai_api_key"] = str(normalized.get("openai_api_key", "")).strip()
+
     backend = str(normalized.get("llm_backend", "auto")).lower()
     normalized["llm_backend"] = backend if backend in ("auto", "anthropic", "local") else "auto"
+    recording_backend = str(normalized.get("audio_input_backend", "auto")).lower()
+    normalized["audio_input_backend"] = recording_backend if recording_backend in ("auto", "pyaudio", "sounddevice") else "auto"
+    normalized["audio_input_device"] = str(normalized.get("audio_input_device", "")).strip()
+    legacy_prompt = _read_legacy_prompt() if "summary_modes" not in normalized else ""
+    normalized["summary_modes"] = _coerce_summary_modes(normalized.get("summary_modes"), legacy_prompt)
+    active_mode = str(normalized.get("active_summary_mode") or SUMMARY_MODE_GENERAL_ID).strip().lower()
+    if active_mode not in {mode["id"] for mode in normalized["summary_modes"]}:
+        active_mode = SUMMARY_MODE_GENERAL_ID
+    normalized["active_summary_mode"] = active_mode
     return normalized
 
 
@@ -115,6 +138,108 @@ def _get_shared_dir():
     return d
 
 
+def _preferred_recording_backend():
+    if importlib.util.find_spec("pyaudio") is not None:
+        return "pyaudio"
+    if sd is not None:
+        return "sounddevice"
+    return ""
+
+
+def _list_audio_input_devices(backend=None):
+    backend = backend or _preferred_recording_backend()
+    options = [{
+        "id": "",
+        "label": "System Default",
+        "backend": backend,
+        "name": "System Default",
+    }]
+    if backend == "pyaudio":
+        try:
+            import pyaudio
+        except ImportError:
+            return options
+        pa = pyaudio.PyAudio()
+        try:
+            try:
+                default_index = int(pa.get_default_input_device_info().get("index"))
+            except Exception:
+                default_index = None
+            for idx in range(pa.get_device_count()):
+                try:
+                    info = pa.get_device_info_by_index(idx)
+                except Exception:
+                    continue
+                if int(info.get("maxInputChannels", 0) or 0) <= 0:
+                    continue
+                label = str(info.get("name") or f"Input {idx}").strip()
+                try:
+                    host_name = pa.get_host_api_info_by_index(int(info.get("hostApi", 0))).get("name", "")
+                except Exception:
+                    host_name = ""
+                if host_name:
+                    label += f" ({host_name})"
+                if default_index == idx:
+                    label += " [Default]"
+                options.append({
+                    "id": str(idx),
+                    "label": label,
+                    "backend": "pyaudio",
+                    "name": str(info.get("name") or label),
+                })
+        finally:
+            pa.terminate()
+    elif backend == "sounddevice" and sd is not None:
+        try:
+            devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
+            default_raw = sd.default.device
+            default_index = default_raw[0] if isinstance(default_raw, (list, tuple)) else default_raw
+        except Exception:
+            devices = []
+            hostapis = []
+            default_index = None
+        for idx, info in enumerate(devices):
+            if int(info.get("max_input_channels", 0) or 0) <= 0:
+                continue
+            label = str(info.get("name") or f"Input {idx}").strip()
+            host_name = ""
+            try:
+                host_name = hostapis[int(info.get("hostapi", 0))].get("name", "")
+            except Exception:
+                host_name = ""
+            if host_name:
+                label += f" ({host_name})"
+            if default_index == idx:
+                label += " [Default]"
+            options.append({
+                "id": str(idx),
+                "label": label,
+                "backend": "sounddevice",
+                "name": str(info.get("name") or label),
+            })
+    return options
+
+
+def _resolve_audio_input_device(backend):
+    cfg = _load_config()
+    device_id = str(cfg.get("audio_input_device", "")).strip()
+    if not device_id:
+        return None
+    configured_backend = str(cfg.get("audio_input_backend", "auto")).lower()
+    effective_backend = _preferred_recording_backend() if configured_backend == "auto" else configured_backend
+    if effective_backend != backend:
+        return None
+    options = _list_audio_input_devices(backend)
+    valid_ids = {item["id"] for item in options}
+    if device_id not in valid_ids:
+        return None
+    try:
+        return int(device_id)
+    except ValueError:
+        return None
+
+
 # ── Prompt ───────────────────────────────────────────────────────────────────
 _DEFAULT_PROMPT = (
     "Below is a transcript of a recorded conversation.\n\n"
@@ -128,14 +253,130 @@ _DEFAULT_PROMPT = (
     '"bugs": "list any software issues or bugs mentioned explicitly in the conversation"}\n'
 )
 
+SUMMARY_MODE_GENERAL_ID = "general"
 
-def _get_summary_prompt():
+
+def _summary_prompt(extra_instructions):
+    return (
+        "Below is a transcript of a recorded conversation.\n\n"
+        "{transcript}\n\n"
+        "Respond with ONLY a JSON object (no other text, no markdown). "
+        "Use exactly these keys:\n"
+        '{"title": "1-5 word Title Case name", '
+        '"summary": "2-4 sentence summary", '
+        '"speakers": 1, '
+        '"corrections": "list any likely transcription errors and suggested corrections", '
+        '"bugs": "list any software issues or bugs mentioned explicitly in the conversation"}\n'
+        f"{extra_instructions}\n"
+    )
+
+
+_DEFAULT_SUMMARY_MODES = [
+    {"id": SUMMARY_MODE_GENERAL_ID, "title": "General", "prompt": _DEFAULT_PROMPT},
+    {
+        "id": "work_meeting",
+        "title": "Work Meeting",
+        "prompt": _summary_prompt(
+            "Optimize for work meetings. Emphasize decisions, owners, deadlines, blockers, and follow-up actions."
+        ),
+    },
+    {
+        "id": "user_research",
+        "title": "User Research",
+        "prompt": _summary_prompt(
+            "Optimize for user research. Emphasize participant goals, pain points, notable quotes, observed behavior, and product insights."
+        ),
+    },
+    {
+        "id": "accountability_call",
+        "title": "Accountability Call",
+        "prompt": _summary_prompt(
+            "Optimize for an accountability call. Emphasize commitments, promises, deadlines, progress updates, risks, and next check-in items."
+        ),
+    },
+    {
+        "id": "negotiation_agreement_call",
+        "title": "Negotiation Agreement Call",
+        "prompt": _summary_prompt(
+            "Optimize for a negotiation or agreement call. Emphasize terms discussed, points of alignment, open issues, concessions, and explicit commitments."
+        ),
+    },
+]
+
+
+def _read_legacy_prompt():
     if os.path.exists(PROMPT_FILE):
-        with open(PROMPT_FILE) as f:
-            text = f.read().strip()
-            if text:
-                return text
-    return _DEFAULT_PROMPT
+        try:
+            with open(PROMPT_FILE, encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def _default_summary_modes(legacy_general_prompt=None):
+    modes = [dict(mode) for mode in _DEFAULT_SUMMARY_MODES]
+    if legacy_general_prompt:
+        modes[0]["prompt"] = legacy_general_prompt
+    return modes
+
+
+def _coerce_summary_modes(raw_modes, legacy_general_prompt=None):
+    defaults = _default_summary_modes(legacy_general_prompt)
+    normalized = []
+    seen_ids = set()
+    general_prompt = legacy_general_prompt or defaults[0]["prompt"]
+    if isinstance(raw_modes, list):
+        for idx, item in enumerate(raw_modes):
+            if not isinstance(item, dict):
+                continue
+            mode_id = str(item.get("id") or "").strip().lower()
+            title = str(item.get("title") or "").strip()
+            prompt = str(item.get("prompt") or "").strip()
+            if not prompt:
+                continue
+            if mode_id == SUMMARY_MODE_GENERAL_ID:
+                general_prompt = prompt
+            if not mode_id:
+                mode_id = f"custom_{idx + 1}"
+            if mode_id in seen_ids:
+                continue
+            seen_ids.add(mode_id)
+            normalized.append({
+                "id": mode_id,
+                "title": "General" if mode_id == SUMMARY_MODE_GENERAL_ID else (title or f"Mode {idx + 1}"),
+                "prompt": prompt,
+            })
+    result = [{
+        "id": SUMMARY_MODE_GENERAL_ID,
+        "title": "General",
+        "prompt": general_prompt,
+    }]
+    seen = {SUMMARY_MODE_GENERAL_ID}
+    for item in normalized:
+        if item["id"] == SUMMARY_MODE_GENERAL_ID or item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        result.append(item)
+    default_ids = {mode["id"] for mode in result}
+    for item in defaults[1:]:
+        if item["id"] not in default_ids:
+            result.append(dict(item))
+    return result
+
+
+def _get_summary_mode(mode_id=None):
+    cfg = _load_config()
+    modes = cfg.get("summary_modes", _default_summary_modes())
+    active_id = str(mode_id or cfg.get("active_summary_mode") or SUMMARY_MODE_GENERAL_ID).strip().lower()
+    for mode in modes:
+        if mode.get("id") == active_id:
+            return dict(mode)
+    return dict(modes[0])
+
+
+def _get_summary_prompt(mode_id=None):
+    return _get_summary_mode(mode_id).get("prompt", _DEFAULT_PROMPT)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -169,19 +410,29 @@ def _fallback_ai_fields(transcript):
     }
 
 
+def _apply_manual_note_overrides(meta, title, summary):
+    if bool(meta.get("title_manual")):
+        manual_title = str(meta.get("title") or "").strip()
+        if manual_title:
+            title = manual_title
+    if bool(meta.get("summary_manual")):
+        summary = str(meta.get("summary") or "").strip()
+    return title, summary
+
+
 def _datetime_slug():
     return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def _save_meta(meta):
     path = os.path.join(REC_DIR, meta["slug"] + ".json")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
 
 def _load_recording(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -199,6 +450,38 @@ def _subprocess_kwargs():
     if os.name != "nt":
         return {}
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
+def _normalise_import_audio(source_path, slug, shared_dir):
+    """Return (import_path, staged_ext, rec_wav_path) for an imported audio file.
+
+    Native WAV and MP3 files keep their original container. Other formats are
+    transcoded with ffmpeg into a real WAV so downstream Whisper/ffmpeg steps do
+    not operate on mislabeled files.
+    """
+    ext = os.path.splitext(source_path)[1].lower()
+    import shutil
+
+    if ext in (".wav", ".mp3"):
+        dest = os.path.join(shared_dir, slug + ext)
+        shutil.copy2(source_path, dest)
+        wav_path = None
+        if ext == ".wav":
+            wav_path = os.path.join(REC_DIR, slug + ".wav")
+            shutil.copy2(source_path, wav_path)
+        return source_path, ext, wav_path
+
+    if not _ffmpeg_available():
+        raise RuntimeError(f"Unsupported import format {ext or '<none>'} without ffmpeg")
+
+    wav_path = os.path.join(REC_DIR, slug + ".wav")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", source_path, "-ac", "1", "-ar", "16000", wav_path],
+        capture_output=True,
+        check=True,
+        **_subprocess_kwargs(),
+    )
+    return wav_path, ".wav", wav_path
 
 
 # ── Whisper (lazy singleton) ─────────────────────────────────────────────────
@@ -312,6 +595,105 @@ def _transcribe_segments(audio_file_path, **kwargs):
         return model.transcribe(audio_file_path, **kwargs)
 
 
+def _transcription_backend(cfg=None):
+    cfg = cfg or _load_config()
+    return str(cfg.get("transcription_backend", "local")).lower()
+
+
+def _selected_openai_transcription_model(cfg=None):
+    cfg = cfg or _load_config()
+    model_name = str(cfg.get("openai_transcription_model", OPENAI_TRANSCRIPTION_DEFAULT_MODEL)).strip()
+    return model_name if model_name in OPENAI_TRANSCRIPTION_MODELS else OPENAI_TRANSCRIPTION_DEFAULT_MODEL
+
+
+def _openai_transcription_api_key(cfg=None):
+    cfg = cfg or _load_config()
+    return str(cfg.get("openai_api_key") or os.environ.get("OPENAI_API_KEY") or "").strip()
+
+
+def _encode_multipart_form(fields, file_field_name, file_path):
+    boundary = f"----MuesliBoundary{uuid.uuid4().hex}"
+    body = bytearray()
+
+    def _append_text(name, value):
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    for field_name, field_value in fields.items():
+        if field_value is None:
+            continue
+        _append_text(field_name, field_value)
+
+    filename = os.path.basename(file_path)
+    ext = os.path.splitext(filename)[1].lower()
+    content_type = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".mp4": "audio/mp4",
+        ".mpga": "audio/mpeg",
+        ".mpeg": "audio/mpeg",
+        ".webm": "audio/webm",
+    }.get(ext, "application/octet-stream")
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(
+        f'Content-Disposition: form-data; name="{file_field_name}"; filename="{filename}"\r\n'.encode("utf-8")
+    )
+    body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+    body.extend(file_bytes)
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    return boundary, bytes(body)
+
+
+def _transcribe_openai(audio_file_path):
+    cfg = _load_config()
+    api_key = _openai_transcription_api_key(cfg)
+    if not api_key:
+        raise RuntimeError("OpenAI transcription is selected but no OPENAI_API_KEY or saved OpenAI key is configured")
+
+    model_name = _selected_openai_transcription_model(cfg)
+    boundary, body = _encode_multipart_form(
+        {
+            "model": model_name,
+            "response_format": "json",
+        },
+        "file",
+        audio_file_path,
+    )
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OPENAI_TRANSCRIPTION_TIMEOUT_SEC) as resp:
+            payload = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI transcription failed ({exc.code}): {error_body[:240]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"OpenAI transcription failed: {exc.reason}") from exc
+
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("OpenAI transcription returned invalid JSON") from exc
+
+    transcript = str(data.get("text", "")).strip()
+    if not transcript:
+        raise RuntimeError("OpenAI transcription returned no text")
+    return transcript
+
+
 # ── LLM (lazy singleton) ─────────────────────────────────────────────────────
 _llm_model = None
 _llm_lock = threading.Lock()
@@ -362,15 +744,15 @@ def _recommend_ollama_model(models):
         return None
     lowered = {name.lower(): name for name in models}
     for candidate in (
+        "deepseek-r1:8b",
+        "qwen3:8b",
         "qwen3.5:4b",
         "qwen3.5:9b",
-        "qwen3:8b",
         "gemma4:e4b",
         "gemma4:4b",
         "llama3.1:8b",
         "mistral:7b",
         "phi4",
-        "deepseek-r1:8b",
     ):
         if candidate in lowered:
             return lowered[candidate]
@@ -443,7 +825,7 @@ def _llm_generate(prompt_text):
             resp = _ollama_request(
                 "/api/generate",
                 {"model": model_name, "prompt": prompt_text, "stream": False},
-                timeout=120,
+                timeout=420,
             )
             text = str(resp.get("response", "")).strip()
             if text:
@@ -474,7 +856,7 @@ def _llm_generate(prompt_text):
 
 # ── Chunk pipeline ───────────────────────────────────────────────────────────
 class _ChunkPipeline:
-    """Background worker: transcribe + summarise 30s audio chunks."""
+    """Background worker: transcribe + summarise short live audio chunks."""
 
     def __init__(self, on_transcribed=None):
         self._transcripts = []
@@ -518,18 +900,8 @@ class _ChunkPipeline:
             if self._on_transcribed:
                 self._on_transcribed(n, self._full_text)
 
-            # Summarise chunk
-            if text:
-                try:
-                    summary = _llm_generate(
-                        "Summarise this conversation excerpt in 1-2 sentences. "
-                        "Also note how many distinct speakers you detect.\n\n" + text
-                    )
-                    self._summaries.append(summary)
-                except Exception:
-                    self._summaries.append("")
-            else:
-                self._summaries.append("")
+            # Keep live transcript delivery independent from slower LLM work.
+            self._summaries.append("")
 
     @property
     def transcript(self):
@@ -557,6 +929,7 @@ class Muesli:
         self._chunk_idx = 0
         self._record_backend = None
         self._sample_width = 2
+        self._sd_chunk_frames = []
         if auto_resume:
             self.resume_interrupted()
 
@@ -645,7 +1018,7 @@ class Muesli:
 
         Args:
             on_transcribed: optional callback(chunk_num, text_so_far) called
-                            each time a 30s chunk is transcribed.
+                            each time a live chunk is transcribed.
         """
         if self._recording:
             raise RuntimeError("Already recording")
@@ -664,33 +1037,54 @@ class Muesli:
         self._chunk_idx = 0
         self._recording = True
         self._rec_started = time.time()
+        self._sd_chunk_frames = []
+        selected_device = _resolve_audio_input_device(self._record_backend)
 
         self._pipeline = _ChunkPipeline(on_transcribed=on_transcribed)
         if self._record_backend == "pyaudio":
             import pyaudio
-            self._stream = self._pa.open(
+            open_kwargs = dict(
                 format=pyaudio.paInt16,
                 channels=CHANNELS,
                 rate=RATE,
                 input=True,
                 frames_per_buffer=CHUNK,
             )
+            if selected_device is not None:
+                open_kwargs["input_device_index"] = selected_device
+            try:
+                self._stream = self._pa.open(**open_kwargs)
+            except Exception:
+                open_kwargs.pop("input_device_index", None)
+                self._stream = self._pa.open(**open_kwargs)
             self._rec_thread = threading.Thread(target=self._record_loop, daemon=True)
             self._rec_thread.start()
         else:
-            self._stream = sd.InputStream(
+            stream_kwargs = dict(
                 samplerate=RATE,
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=CHUNK,
                 callback=self._record_sounddevice,
             )
+            if selected_device is not None:
+                stream_kwargs["device"] = selected_device
+            try:
+                self._stream = sd.InputStream(**stream_kwargs)
+            except Exception:
+                stream_kwargs.pop("device", None)
+                self._stream = sd.InputStream(**stream_kwargs)
             self._stream.start()
 
     def _record_sounddevice(self, indata, frames, time_info, status):
         if not self._recording:
             return
-        self._frames.append(indata.copy().tobytes())
+        data = indata.copy().tobytes()
+        self._frames.append(data)
+        self._sd_chunk_frames.append(data)
+        if len(self._sd_chunk_frames) >= _READS_PER_CHUNK:
+            self._emit_chunk(self._sd_chunk_frames)
+            self._sd_chunk_frames = []
 
     def _record_loop(self):
         chunk_frames = []
@@ -706,12 +1100,11 @@ class Muesli:
             self._emit_chunk(chunk_frames)
 
     def _emit_chunk(self, frames):
-        import pyaudio
         self._chunk_idx += 1
         path = os.path.join(REC_DIR, f"{self._rec_slug}_chunk{self._chunk_idx}.wav")
         wf = wave.open(path, "wb")
         wf.setnchannels(CHANNELS)
-        wf.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
+        wf.setsampwidth(self._sample_width)
         wf.setframerate(RATE)
         wf.writeframes(b"".join(frames))
         wf.close()
@@ -742,6 +1135,9 @@ class Muesli:
             else:
                 self._stream.stop()
                 self._stream.close()
+        if self._record_backend == "sounddevice" and self._sd_chunk_frames:
+            self._emit_chunk(self._sd_chunk_frames)
+            self._sd_chunk_frames = []
 
         duration = time.time() - self._rec_started
 
@@ -783,6 +1179,7 @@ class Muesli:
         self._record_backend = None
         self._pipeline = None
         self._rec_started = None
+        self._sd_chunk_frames = []
 
         return meta
 
@@ -791,6 +1188,7 @@ class Muesli:
         slug = meta["slug"]
         mp3_path = os.path.join(self._shared_dir, slug + ".mp3")
         wav_dest = os.path.join(self._shared_dir, slug + ".wav")
+        active_summary_mode = _get_summary_mode()
 
         # WAV -> MP3
         if not os.path.exists(mp3_path) and not os.path.exists(wav_dest):
@@ -819,12 +1217,12 @@ class Muesli:
         try:
             if summaries and any(summaries):
                 merged = "\n".join(f"- {s}" for s in summaries if s)
-                prompt_text = _get_summary_prompt().replace(
+                prompt_text = active_summary_mode["prompt"].replace(
                     "{transcript}",
                     f"[Chunk summaries from a longer recording]\n{merged}",
                 )
             else:
-                prompt_text = _get_summary_prompt().replace("{transcript}", transcript or "")
+                prompt_text = active_summary_mode["prompt"].replace("{transcript}", transcript or "")
             raw = _llm_generate(prompt_text)
             raw = re.sub(r"^```[a-z]*\n?", "", raw)
             raw = re.sub(r"\n?```$", "", raw)
@@ -836,13 +1234,14 @@ class Muesli:
         default_title = _default_session_title(meta.get("started_at", ""))
         title = ai.get("title", "").strip() or default_title
         summary = ai.get("summary", "").strip() if llm_used else ""
+        title, summary = _apply_manual_note_overrides(meta, title, summary)
         speakers = int(ai.get("speakers", 0) or 0) if llm_used else 0
         corrections = ai.get("corrections", "")
         bugs = ai.get("bugs", "")
 
         # Only rename files when an LLM supplied a real title.
         new_slug = slug
-        if llm_used and title:
+        if (llm_used or meta.get("title_manual")) and title:
             base_slug = _slug_from_title(title)
             candidate = base_slug
             i = 2
@@ -871,7 +1270,7 @@ class Muesli:
         if bugs:
             txt_body += f"## Bugs / Issues Mentioned\n\n{bugs}\n\n"
         txt_body += f"## Transcript\n\n{transcript}\n"
-        with open(txt_path, "w") as f:
+        with open(txt_path, "w", encoding="utf-8") as f:
             f.write(txt_body)
 
         # Remove old metadata if slug changed
@@ -889,6 +1288,8 @@ class Muesli:
             "bugs": bugs,
             "status": "done",
             "audio_path": self.audio_path(new_slug),
+            "summary_mode": active_summary_mode["id"],
+            "summary_mode_title": active_summary_mode["title"],
         })
         meta.pop("error", None)
         _save_meta(meta)
@@ -897,7 +1298,7 @@ class Muesli:
     # ── Process existing file ────────────────────────────────────────────────
 
     def process_file(self, audio_file_path):
-        """Transcribe and summarise an existing audio file (WAV or MP3).
+        """Transcribe and summarise an existing audio file.
 
         Returns the full session dict.
         """
@@ -905,20 +1306,7 @@ class Muesli:
             raise FileNotFoundError(audio_file_path)
 
         slug = _datetime_slug()
-        # Copy source to shared dir
-        ext = os.path.splitext(audio_file_path)[1].lower()
-        if ext not in (".wav", ".mp3"):
-            ext = ".wav"
-
-        import shutil
-        dest = os.path.join(self._shared_dir, slug + ext)
-        shutil.copy2(audio_file_path, dest)
-
-        # If WAV, also keep a copy in REC_DIR for processing
-        wav_path = None
-        if ext == ".wav":
-            wav_path = os.path.join(REC_DIR, slug + ".wav")
-            shutil.copy2(audio_file_path, wav_path)
+        import_path, _, wav_path = _normalise_import_audio(audio_file_path, slug, self._shared_dir)
 
         # Get duration via ffprobe if available
         duration = self._probe_duration(audio_file_path)
@@ -937,12 +1325,12 @@ class Muesli:
         _save_meta(meta)
 
         # Transcribe
-        transcript = self.transcribe(audio_file_path)
+        transcript = self.transcribe(import_path)
 
         # Finalise (summary, rename, save)
         meta = self._finalize(
             meta,
-            wav_path or audio_file_path,
+            wav_path or import_path,
             transcript,
             summaries=None,
         )
@@ -969,6 +1357,13 @@ class Muesli:
 
     def transcribe_with_progress(self, audio_file_path, on_percent=None):
         """Transcribe with optional progress callback. on_percent(int) called with 0-100."""
+        if _transcription_backend() in ("openai", "openai_realtime"):
+            if on_percent:
+                on_percent(5)
+            transcript = _transcribe_openai(audio_file_path)
+            if on_percent:
+                on_percent(100)
+            return transcript
         segments, info = _transcribe_segments(audio_file_path, beam_size=5)
         total_duration = info.duration if info.duration else 0
         collected = []
@@ -986,9 +1381,9 @@ class Muesli:
 
     # ── Summarize ────────────────────────────────────────────────────────────
 
-    def summarize(self, transcript):
+    def summarize(self, transcript, prompt_text=None):
         """Summarise a transcript string. Returns dict with title, summary, speakers, etc."""
-        prompt_text = _get_summary_prompt().replace("{transcript}", transcript)
+        prompt_text = (prompt_text or _get_summary_prompt()).replace("{transcript}", transcript)
         try:
             raw = _llm_generate(prompt_text)
             raw = re.sub(r"^```[a-z]*\n?", "", raw)
@@ -996,6 +1391,93 @@ class Muesli:
             return json.loads(raw)
         except Exception:
             return _fallback_ai_fields(transcript)
+
+    def resummarize_session(self, session_or_slug, prompt_text=None, mode_id=None, mode_title=None):
+        """Re-run summary/title generation for an existing session."""
+        meta = dict(session_or_slug) if isinstance(session_or_slug, dict) else (self.get_session(session_or_slug) or {})
+        slug = meta.get("slug", "")
+        if not slug:
+            raise ValueError("Missing session slug")
+
+        transcript = (meta.get("transcript") or "").strip()
+        if not transcript:
+            audio_path = self.audio_path(slug) or self._find_audio_for_slug(slug)
+            if not audio_path:
+                raise FileNotFoundError(f"No audio found for session {slug}")
+            transcript = self.transcribe(audio_path)
+
+        mode = _get_summary_mode(mode_id)
+        ai = self.summarize(transcript, prompt_text=prompt_text or mode["prompt"])
+        llm_used = bool(
+            (ai.get("title") or "").strip()
+            or (ai.get("summary") or "").strip()
+            or int(ai.get("speakers", 0) or 0)
+            or (ai.get("corrections") or "").strip()
+            or (ai.get("bugs") or "").strip()
+        )
+
+        default_title = _default_session_title(meta.get("started_at", ""))
+        title = (ai.get("title") or "").strip() or default_title
+        summary = (ai.get("summary") or "").strip() if llm_used else ""
+        title, summary = _apply_manual_note_overrides(meta, title, summary)
+        speakers = int(ai.get("speakers", 0) or 0) if llm_used else 0
+        corrections = ai.get("corrections", "")
+        bugs = ai.get("bugs", "")
+
+        new_slug = slug
+        if (llm_used or meta.get("title_manual")) and title:
+            base_slug = _slug_from_title(title)
+            candidate = base_slug
+            i = 2
+            while (os.path.exists(os.path.join(REC_DIR, candidate + ".json")) and candidate != slug):
+                candidate = f"{base_slug}-{i}"
+                i += 1
+            new_slug = candidate
+
+        if new_slug != slug:
+            for ext in (".mp3", ".wav"):
+                old_audio = os.path.join(self._shared_dir, slug + ext)
+                new_audio = os.path.join(self._shared_dir, new_slug + ext)
+                if os.path.exists(old_audio):
+                    os.rename(old_audio, new_audio)
+                    break
+
+        txt_path = os.path.join(self._shared_dir, new_slug + ".txt")
+        txt_body = f"# {title}\n\n"
+        if summary:
+            txt_body += f"## Summary\n\n{summary}\n\n"
+        if corrections:
+            txt_body += f"## Transcription Corrections\n\n{corrections}\n\n"
+        if bugs:
+            txt_body += f"## Bugs / Issues Mentioned\n\n{bugs}\n\n"
+        txt_body += f"## Transcript\n\n{transcript}\n"
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(txt_body)
+
+        old_txt = os.path.join(self._shared_dir, slug + ".txt")
+        if new_slug != slug and os.path.exists(old_txt):
+            os.remove(old_txt)
+
+        old_json = os.path.join(REC_DIR, slug + ".json")
+        if new_slug != slug and os.path.exists(old_json):
+            os.remove(old_json)
+
+        meta.update({
+            "slug": new_slug,
+            "title": title,
+            "summary": summary,
+            "transcript": transcript,
+            "speakers": speakers,
+            "corrections": corrections,
+            "bugs": bugs,
+            "status": "done",
+            "audio_path": self.audio_path(new_slug),
+            "summary_mode": mode_id or mode["id"],
+            "summary_mode_title": mode_title or mode["title"],
+        })
+        meta.pop("error", None)
+        _save_meta(meta)
+        return meta
 
     # ── Session access ───────────────────────────────────────────────────────
 

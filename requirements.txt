@@ -4,3 +4,4 @@ pygame-ce
 huggingface-hub
 anthropic
 sounddevice
+websocket-client
