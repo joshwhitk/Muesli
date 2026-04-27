@@ -250,6 +250,29 @@ outputs/                    batch outputs and sidecar mirror (not committed)
 - Tests are still smoke-test oriented
 - The GUI still has some Windows-specific rough edges
 
+## Planned Local Service Surface
+
+Muesli does not ship an MCP server yet, but the current desktop/API code already maps cleanly to a local app-service surface for other tools on secure devices.
+
+Likely first-pass services:
+
+- record new audio from the default system microphone
+- transcribe an audio file and return text
+- ingest an existing audio file as a voice note and process it as though it was recorded locally
+- search voice notes deterministically over saved fields
+- search voice notes with an LLM over transcript/summary/title
+- retrieve voice-note component data such as audio, transcript, summary, title, date, status, duration, and speaker count
+- re-generate individual components such as summary or title without re-recording audio
+- overwrite or save corrected title / summary / transcript data back into the local note
+- delete notes and their managed local artifacts
+
+Important boundaries for that future service layer:
+
+- keep secrets out of any shared app registry
+- support local-only, free-cloud, and paid-cloud backends through config, not registry secrets
+- prefer read/write note operations over desktop-control operations such as tray clicks or hotkey control
+- treat audio import, transcription, summarization, and note metadata as separable operations so other apps can compose them safely
+
 ## Task List
 
 - Build a proper Windows installer

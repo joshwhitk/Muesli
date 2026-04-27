@@ -666,6 +666,34 @@ check("Sessions with saved audio expose a reprocess action in the detail panel",
 check("GUI reprocess path forces a fresh transcript pass from saved audio",
       'target["transcript"] = ""' in gui_source and
       'target["summary"] = "Reprocessing from saved audio..."' in gui_source)
+check("GUI reprocess/resume progress is persisted into processing_stage metadata",
+      'target["processing_stage"] = "queued"' in gui_source and
+      'meta["processing_stage"] = stage_text' in gui_source and
+      'meta.pop("processing_stage", None)' in gui_source)
+check("Detail pane shows live processing-stage text for saved-audio reprocessing",
+      'status_text = f"Processing: {processing_stage}"' in gui_source and
+      'status_note=processing_stage or "Processing saved audio..."' in gui_source)
+check("Detail pane uses a split review surface with a recording-flow card",
+      'text="Recording flow"' in gui_source and
+      'self._flow_note_var = tk.StringVar' in gui_source and
+      'flow_card = tk.Frame(split, bg=ITEM_BG' in gui_source)
+check("Detail pane exposes tabbed summary and transcript views",
+      'self._summary_tab_btn = RoundedButton(' in gui_source and
+      'self._transcript_tab_btn = RoundedButton(' in gui_source and
+      'command=lambda: self._set_content_view("summary")' in gui_source and
+      'command=lambda: self._set_content_view("transcript")' in gui_source)
+check("Detail pane refreshes active tab state and swaps view-specific actions",
+      'def _refresh_content_view(self):' in gui_source and
+      'self._open_transcript_btn.pack(side="left")' in gui_source and
+      'self._edit_summary_btn.pack(side="left")' in gui_source)
+check("GUI publishes runtime state immediately and keeps polling alive after transient errors",
+      'self._publish_runtime_state()' in gui_source and
+      'runtime_poll_failed' in gui_source and
+      'finally:\n            self.after(1000, self._poll_runtime_state)' in gui_source)
+check("Pause-processing refresh targets the actual RoundedButton instead of a generic child widget",
+      'self._pause_btn = RoundedButton(' in gui_source and
+      'self._pause_btn.pack(side="right", padx=(0, 10))' in gui_source and
+      'top.winfo_children()[0]' not in gui_source)
 check("Transcript sidecars are always written as UTF-8 during finalize paths",
       'with open(txt_path, "w", encoding="utf-8") as f:' in api_source and
       'def _write_session_text_file(slug, title, summary, transcript, corrections="", bugs=""):' in gui_source and
@@ -689,6 +717,11 @@ check("GUI launcher uses the bootstrap entrypoint and explicit PowerShell path f
       'powershellExe = shell.ExpandEnvironmentStrings("%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")' in launcher_source and
       'tracePath = root & "\\.launch_trace_" & token & ".log"' in launcher_source and
       'AppendTrace("python_launch_requested"' in launcher_source)
+check("GUI launcher prefers pythonw for the normal hidden app launch path",
+      'pythonwExe = root & "\\.venv\\Scripts\\pythonw.exe"' in launcher_source and
+      'selectedPython = pythonExe' in launcher_source and
+      'If fso.FileExists(pythonwExe) Then' in launcher_source and
+      'selectedPython = pythonwExe' in launcher_source)
 check("Python bootstrap updates launch status before importing the full GUI module",
       'MUESLI_BOOTSTRAP_STARTED_AT' in bootstrap_source and
       'progress=8' in bootstrap_source and
@@ -786,8 +819,8 @@ check("GUI can export the selected session to Obsidian",
       'def _export_session_to_obsidian(meta, cfg=None):' in gui_source and
       'text="Export Obsidian"' in gui_source and
       'def _export_current_to_obsidian(self):' in gui_source)
-check("Detail panel includes the transcription process diagram",
-      'text="Process"' in gui_source and
+check("Detail panel includes the recording-flow diagram surface",
+      'text="Recording flow"' in gui_source and
       'self._process_canvas = tk.Canvas' in gui_source and
       'def _draw_process_diagram(self):' in gui_source and
       'def _sync_process_diagram(self, meta):' in gui_source)

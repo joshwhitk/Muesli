@@ -1,4 +1,4 @@
-Dim fso, shell, root, pythonExe, guiScript, bootstrapScript, splashScript, statusPath, tracePath, cmd, splashCmd, token, i, textFile, powershellExe
+Dim fso, shell, root, pythonExe, pythonwExe, selectedPython, guiScript, bootstrapScript, splashScript, statusPath, tracePath, cmd, splashCmd, token, i, textFile, powershellExe
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set shell = CreateObject("WScript.Shell")
@@ -6,6 +6,7 @@ Randomize
 
 root = fso.GetParentFolderName(WScript.ScriptFullName)
 pythonExe = root & "\.venv\Scripts\python.exe"
+pythonwExe = root & "\.venv\Scripts\pythonw.exe"
 guiScript = root & "\muesli_gui.py"
 bootstrapScript = root & "\muesli_gui_bootstrap.py"
 splashScript = root & "\muesli_splash.ps1"
@@ -13,10 +14,14 @@ token = CStr(Fix(Timer * 1000)) & "-" & CStr(Int((Rnd * 900000) + 100000))
 statusPath = root & "\.launch_status_" & token & ".json"
 tracePath = root & "\.launch_trace_" & token & ".log"
 powershellExe = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
+selectedPython = pythonExe
+If fso.FileExists(pythonwExe) Then
+    selectedPython = pythonwExe
+End If
 If fso.FileExists(bootstrapScript) Then
-    cmd = Chr(34) & pythonExe & Chr(34) & " " & Chr(34) & bootstrapScript & Chr(34) & " --launch-token " & Chr(34) & token & Chr(34)
+    cmd = Chr(34) & selectedPython & Chr(34) & " " & Chr(34) & bootstrapScript & Chr(34) & " --launch-token " & Chr(34) & token & Chr(34)
 Else
-    cmd = Chr(34) & pythonExe & Chr(34) & " " & Chr(34) & guiScript & Chr(34) & " --launch-token " & Chr(34) & token & Chr(34)
+    cmd = Chr(34) & selectedPython & Chr(34) & " " & Chr(34) & guiScript & Chr(34) & " --launch-token " & Chr(34) & token & Chr(34)
 End If
 
 Sub AppendTrace(eventName, detailText)

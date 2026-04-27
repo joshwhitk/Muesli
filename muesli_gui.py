@@ -3365,6 +3365,7 @@ class MuesliApp(tk.Tk):
             detail="Starting the IPC listener and runtime status polling.",
         )
         self._start_ipc_listener()
+        self._publish_runtime_state()
         self.after(250, self._poll_runtime_state)
         self.after(120, self._mark_launch_ready)
         self._launch_probe.end(
@@ -3531,11 +3532,13 @@ class MuesliApp(tk.Tk):
         LLM is no longer preloaded — Claude API is preferred (fast), local LLM is fallback only."""
         # Resume interrupted recordings
         if not self._interrupted:
+            self.after(0, self._publish_runtime_state)
             self.after(0, lambda: self._status_var.set("Ready"))
             return
 
         n = len(self._interrupted)
         self._resume_active = True
+        self.after(0, lambda: self._publish_runtime_state(status_override="Processing"))
         self.after(0, lambda: self._status_var.set(
             f"Resuming {n} interrupted recording{'s' if n != 1 else ''}…"))
 
@@ -3548,12 +3551,14 @@ class MuesliApp(tk.Tk):
             if not audio:
                 meta["status"] = "error"
                 meta["error"] = "No audio file found"
+                meta.pop("processing_stage", None)
                 _save_meta(meta)
                 self._resume_progress.pop(slug, None)
                 self.after(0, self._refresh_list)
                 continue
-            self._resume_progress[slug] = "starting"
-            self.after(0, self._redraw_labels)
+            meta["processing_stage"] = "starting"
+            _save_meta(meta)
+            self.after(0, lambda s=slug: self._apply_processing_progress(s, "starting", "Resuming"))
             try:
                 m._resume_session(meta, audio,
                     on_progress=lambda s, stage: self._on_resume_progress(s, stage))
@@ -3561,12 +3566,14 @@ class MuesliApp(tk.Tk):
             except Exception as e:
                 meta["status"] = "error"
                 meta["error"] = f"Resume failed: {str(e)[:200]}"
+                meta.pop("processing_stage", None)
                 _save_meta(meta)
             self._resume_progress.pop(slug, None)
             self.after(0, self._refresh_list)
 
         self._resume_active = False
         msg = f"Resumed {done} recording{'s' if done != 1 else ''}" if done else "Ready"
+        self.after(0, self._publish_runtime_state)
         self.after(0, lambda: self._status_var.set(msg))
         self.after(0, self._refresh_list)
         self.after(5000, lambda: self._status_var.set("Ready"))
@@ -3574,8 +3581,29 @@ class MuesliApp(tk.Tk):
 
     def _on_resume_progress(self, slug, stage):
         """Called from resume thread with per-session progress updates."""
-        self._resume_progress[slug] = stage
-        self.after(0, self._redraw_labels)
+        self.after(0, lambda s=slug, st=stage: self._apply_processing_progress(s, st, "Resuming"))
+
+    def _apply_processing_progress(self, slug, stage, verb="Processing"):
+        stage_text = str(stage or "").strip()
+        self._resume_progress[slug] = stage_text
+        meta_path = os.path.join(REC_DIR, slug + ".json")
+        meta = load_recording(meta_path) or {"slug": slug}
+        meta["status"] = "processing"
+        if stage_text:
+            meta["processing_stage"] = stage_text
+        else:
+            meta.pop("processing_stage", None)
+        _save_meta(meta)
+        self._refresh_list()
+        self._publish_runtime_state(status_override="Processing")
+        title = meta_title(meta)
+        self._status_var.set(f"{verb} {title}: {stage_text}" if stage_text else f"{verb} {title}...")
+        _append_launch_trace(
+            self._launch_token,
+            "processing_progress",
+            stage="Processing",
+            detail=f"{verb} {slug}: {stage_text or 'working'}",
+        )
 
     def _summary_mode_by_id(self, mode_id=None):
         target_id = str(mode_id or self._active_summary_mode or SUMMARY_MODE_GENERAL_ID).strip().lower()
@@ -3716,6 +3744,7 @@ class MuesliApp(tk.Tk):
 
         self._reprocess_active = True
         target["status"] = "processing"
+        target["processing_stage"] = "queued"
         target["summary"] = "Reprocessing from saved audio..."
         target["transcript"] = ""
         target["speakers"] = 0
@@ -3727,7 +3756,14 @@ class MuesliApp(tk.Tk):
         self._cur_meta = target
         self._detail.show(target)
         self._refresh_list()
+        self._publish_runtime_state(status_override="Processing")
         self._status_var.set(f"Reprocessing {meta_title(target)}...")
+        _append_launch_trace(
+            self._launch_token,
+            "reprocess_started",
+            stage="Processing",
+            detail=f"Reprocessing requested for {slug}",
+        )
 
         def worker():
             try:
@@ -3741,30 +3777,40 @@ class MuesliApp(tk.Tk):
                     audio_path,
                     on_progress=lambda s, stage: self.after(0, lambda slug=s, text=stage: self._on_reprocess_progress(slug, text)),
                 )
+                result.pop("processing_stage", None)
+                _save_meta(result)
                 self.after(0, lambda: self._finish_reprocess(result, slug))
             except Exception as exc:
                 failed = dict(target)
                 failed["status"] = "error"
-                failed["error"] = f"Resubmit failed: {str(exc)[:200]}"
+                failed["error"] = f"Reprocess failed: {str(exc)[:200]}"
+                failed.pop("processing_stage", None)
                 _save_meta(failed)
                 self.after(0, lambda: self._finish_reprocess(failed, slug, success=False))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_reprocess_progress(self, slug, stage):
-        self._resume_progress[slug] = stage
-        self._redraw_labels()
-        self._status_var.set(f"Reprocessing {slug}: {stage}")
+        self._apply_processing_progress(slug, stage, "Reprocessing")
 
     def _finish_reprocess(self, meta, requested_slug, success=True):
         self._reprocess_active = False
         self._resume_progress.pop(requested_slug, None)
+        meta = dict(meta or {})
+        meta.pop("processing_stage", None)
         actual_slug = meta.get("slug", "")
         if actual_slug and actual_slug != requested_slug:
             self._resume_progress.pop(actual_slug, None)
         self._cur_meta = meta
         self._refresh_list()
         self._detail.show(meta)
+        self._publish_runtime_state()
+        _append_launch_trace(
+            self._launch_token,
+            "reprocess_finished",
+            stage="Ready" if success and meta.get("status") == "done" else "Error",
+            detail=f"{requested_slug} -> {meta.get('slug', requested_slug)} ({meta.get('status', 'unknown')})",
+        )
         self._status_var.set(
             f"Reprocessed {meta_title(meta)}"
             if success and meta.get("status") == "done" else
@@ -3848,9 +3894,18 @@ class MuesliApp(tk.Tk):
         )
 
     def _poll_runtime_state(self):
-        self._refresh_processing_pause_button()
-        self._publish_runtime_state()
-        self.after(1000, self._poll_runtime_state)
+        try:
+            self._refresh_processing_pause_button()
+            self._publish_runtime_state()
+        except Exception as exc:
+            _append_launch_trace(
+                self._launch_token,
+                "runtime_poll_failed",
+                stage="Runtime",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            self.after(1000, self._poll_runtime_state)
 
     def _refresh_llm_warning(self):
         message = _llm_status_message()
@@ -3906,7 +3961,7 @@ class MuesliApp(tk.Tk):
         self._rec_btn.pack(side="right")
         if not self._recording_available:
             self._rec_btn.set_enabled(False)
-        RoundedButton(
+        self._pause_btn = RoundedButton(
             top,
             text="Pause Processing",
             command=self._toggle_processing_pause,
@@ -3916,8 +3971,8 @@ class MuesliApp(tk.Tk):
             active_bg=ITEM_ALT,
             shadow="#d7dde7",
             tooltip="Keep recording audio but defer Whisper and LLM work",
-        ).pack(side="right", padx=(0, 10))
-        self._pause_btn = top.winfo_children()[0]
+        )
+        self._pause_btn.pack(side="right", padx=(0, 10))
         RoundedButton(
             top,
             text="Settings",
@@ -4637,6 +4692,7 @@ class DetailPanel(tk.Frame):
         self._live_mode = False
         self._title_manual = False
         self._summary_manual = False
+        self._content_view = "summary"
         self._process_nodes = {
             "audio": "pending",
             "chunks": "pending",
@@ -4808,22 +4864,69 @@ class DetailPanel(tk.Frame):
         self._del_btn.pack(side="left", padx=(10, 0))
 
         # ── Summary ───────────────────────────────────────────────────────
-        tk.Label(c, text="Process", font=("Segoe UI Semibold", 9),
-                 bg=PANEL_BG, fg=FG_DIM).pack(anchor="w", pady=(2, 4))
-        self._process_canvas = tk.Canvas(c, height=76, bg=PANEL_BG, highlightthickness=0, bd=0, relief="flat")
-        self._process_canvas.pack(fill="x", pady=(0, 12))
+        split = tk.Frame(c, bg=PANEL_BG)
+        split.pack(fill="both", expand=True)
+
+        flow_card = tk.Frame(split, bg=ITEM_BG, bd=0, highlightthickness=1, highlightbackground=LINE)
+        flow_card.pack(side="left", fill="both", expand=True, padx=(0, 14))
+        tk.Label(flow_card, text="Recording flow", font=("Segoe UI Semibold", 10),
+                 bg=ITEM_BG, fg=FG).pack(anchor="w", padx=18, pady=(16, 4))
+        self._flow_note_var = tk.StringVar(value="Audio capture, chunking, transcript, summary, then ready.")
+        tk.Label(
+            flow_card,
+            textvariable=self._flow_note_var,
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG_DIM,
+            wraplength=300,
+            justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+        self._process_canvas = tk.Canvas(flow_card, height=170, bg=ITEM_BG, highlightthickness=0, bd=0, relief="flat")
+        self._process_canvas.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         self._process_canvas.bind("<Configure>", lambda _e: self._draw_process_diagram())
 
-        summary_hdr = tk.Frame(c, bg=PANEL_BG)
-        summary_hdr.pack(fill="x", pady=(4, 2))
-        tk.Label(summary_hdr, text="Summary", font=("Segoe UI Semibold", 9),
-                 bg=PANEL_BG, fg=FG_DIM).pack(side="left")
+        text_card = tk.Frame(split, bg=ITEM_BG, bd=0, highlightthickness=1, highlightbackground=LINE)
+        text_card.pack(side="left", fill="both", expand=True)
+
+        text_hdr = tk.Frame(text_card, bg=ITEM_BG)
+        text_hdr.pack(fill="x", padx=18, pady=(16, 10))
+        tab_row = tk.Frame(text_hdr, bg=ITEM_BG)
+        tab_row.pack(side="left")
+        self._summary_tab_btn = RoundedButton(
+            tab_row,
+            text="Summary",
+            command=lambda: self._set_content_view("summary"),
+            font=("Segoe UI Semibold", 9),
+            bg=PANEL_BG,
+            fg=FG,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            pad_x=12,
+            pad_y=5,
+        )
+        self._summary_tab_btn.pack(side="left", padx=(0, 8))
+        self._transcript_tab_btn = RoundedButton(
+            tab_row,
+            text="Transcript",
+            command=lambda: self._set_content_view("transcript"),
+            font=("Segoe UI Semibold", 9),
+            bg=ITEM_BG,
+            fg=FG_DIM,
+            active_bg=ITEM_ALT,
+            shadow="#d7dde7",
+            pad_x=12,
+            pad_y=5,
+        )
+        self._transcript_tab_btn.pack(side="left")
+
+        self._text_action_host = tk.Frame(text_hdr, bg=ITEM_BG)
+        self._text_action_host.pack(side="right")
         self._edit_summary_btn = RoundedButton(
-            summary_hdr,
+            self._text_action_host,
             text="Edit",
             command=self._on_edit_summary_click,
             font=FONT_SM,
-            bg=ITEM_BG,
+            bg=PANEL_BG,
             fg=FG,
             active_bg=ITEM_ALT,
             shadow="#d7dde7",
@@ -4831,24 +4934,42 @@ class DetailPanel(tk.Frame):
             pad_y=5,
             tooltip="Edit summary",
         )
-        self._edit_summary_btn.pack(side="left", padx=(8, 0))
         self._edit_summary_btn.set_enabled(False)
-        self._summary_txt = tk.Text(c, height=4, wrap="word",
-                                    bg=ITEM_BG, fg=FG, relief="flat", bd=0,
-                                    font=("Segoe UI", 10), padx=10, pady=8, state="disabled")
-        self._summary_txt.pack(fill="x", pady=(0, 12))
+        self._text_body = tk.Frame(text_card, bg=ITEM_BG)
+        self._text_body.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        self._summary_panel = tk.Frame(self._text_body, bg=ITEM_BG)
+        self._transcript_panel = tk.Frame(self._text_body, bg=ITEM_BG)
+        tk.Label(
+            self._summary_panel,
+            text="Editable overview for exports, notes, and fast review.",
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG_DIM,
+            wraplength=420,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+        self._summary_txt = tk.Text(
+            self._summary_panel,
+            height=8,
+            wrap="word",
+            bg=PANEL_BG,
+            fg=FG,
+            relief="flat",
+            bd=0,
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=10,
+            state="disabled",
+        )
+        self._summary_txt.pack(fill="both", expand=True)
 
         # ── Transcript ────────────────────────────────────────────────────
-        tr_hdr = tk.Frame(c, bg=PANEL_BG)
-        tr_hdr.pack(fill="x", pady=(0, 2))
-        tk.Label(tr_hdr, text="Transcript", font=("Segoe UI Semibold", 9),
-                 bg=PANEL_BG, fg=FG_DIM).pack(side="left")
         self._open_transcript_btn = RoundedButton(
-            tr_hdr,
+            self._text_action_host,
             text="",
             command=self._open_transcript,
             icon_image=self._notepad_icon,
-            bg=ITEM_BG,
+            bg=PANEL_BG,
             fg=FG,
             active_bg=ITEM_ALT,
             shadow="#d7dde7",
@@ -4856,14 +4977,13 @@ class DetailPanel(tk.Frame):
             pad_y=5,
             tooltip="Open transcript file\nCtrl+O",
         )
-        self._open_transcript_btn.pack(side="left", padx=(8, 0))
         self._copy_btn = RoundedButton(
-            tr_hdr,
+            self._text_action_host,
             text="Copy",
             command=self._copy_transcript,
             font=FONT_SM,
             icon_image=self._copy_icon,
-            bg=ITEM_BG,
+            bg=PANEL_BG,
             fg=FG,
             active_bg=ITEM_ALT,
             shadow="#d7dde7",
@@ -4871,13 +4991,32 @@ class DetailPanel(tk.Frame):
             pad_y=6,
             tooltip="Copy transcript\nCtrl+Shift+C",
         )
-        self._copy_btn.pack(side="left", padx=(8, 0))
         self._open_transcript_btn.set_enabled(False)
         self._copy_btn.set_enabled(False)
-        self._transcript_txt = tk.Text(c, height=10, wrap="word",
-                                       bg=ITEM_BG, fg=FG, relief="flat", bd=0,
-                                       font=FONT_MON, padx=10, pady=8, state="disabled")
+        tk.Label(
+            self._transcript_panel,
+            text="Read the raw transcript while playback or processing continues.",
+            font=FONT_SM,
+            bg=ITEM_BG,
+            fg=FG_DIM,
+            wraplength=420,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+        self._transcript_txt = tk.Text(
+            self._transcript_panel,
+            height=8,
+            wrap="word",
+            bg=PANEL_BG,
+            fg=FG,
+            relief="flat",
+            bd=0,
+            font=FONT_MON,
+            padx=12,
+            pady=10,
+            state="disabled",
+        )
         self._transcript_txt.pack(fill="both", expand=True)
+        self._set_content_view("summary")
 
     # ── Show ──────────────────────────────────────────────────────────────────
     def show_live(self):
@@ -4886,6 +5025,7 @@ class DetailPanel(tk.Frame):
         self._current = None
         self._title_manual = False
         self._summary_manual = False
+        self._content_view = "transcript"
         self._edit_hint_var.set("Click the title to rename. Use Edit to change the summary while recording. Manual edits are preserved.")
         self._placeholder.pack_forget()
         self._content.pack(fill="both", expand=True)
@@ -4905,6 +5045,8 @@ class DetailPanel(tk.Frame):
         self._copy_btn.set_enabled(False)
         self._obsidian_btn.set_enabled(False)
         self._set_text(self._summary_txt, "")
+        self._flow_note_var.set("Listening now. Transcript chunks will appear here before the final summary.")
+        self._refresh_content_view()
         self._set_process_nodes(audio="active", chunks="pending", transcript="pending", summary="pending", ready="pending")
         self.set_live_transcript("", processing=True)
 
@@ -4914,9 +5056,13 @@ class DetailPanel(tk.Frame):
         if summary is not None and not self._summary_manual:
             self._set_text(self._summary_txt, summary)
             if summary.strip():
+                self._set_content_view("summary")
+                self._flow_note_var.set("Early summary is ready. Final transcript and rename still continue.")
                 self._set_process_nodes(summary="active")
         if status_text is not None:
             self._status_lbl.config(text=status_text, fg=YELLOW)
+            if "summary" in status_text.lower():
+                self._flow_note_var.set(status_text)
         if speakers is not None:
             self._speakers_lbl.config(
                 text=f"{speakers} speaker{'s' if speakers != 1 else ''}" if speakers else ""
@@ -4926,6 +5072,7 @@ class DetailPanel(tk.Frame):
         self._live_mode = False
         self._title_manual = bool(meta.get("title_manual"))
         self._summary_manual = bool(meta.get("summary_manual"))
+        self._content_view = "summary"
         self._edit_hint_var.set("Click the title to rename. Use Edit to change the summary. Manual edits are preserved.")
         # Stop playback if switching to a different recording
         if self._current and self._current.get("slug") != meta.get("slug"):
@@ -4959,9 +5106,13 @@ class DetailPanel(tk.Frame):
             text=f"{spk} speaker{'s' if spk != 1 else ''}" if spk else "")
 
         status = meta.get("status", "")
+        processing_stage = str(meta.get("processing_stage", "") or "").strip()
         st_map = {"done": "Ready", "processing": "Processing...", "error": "Error"}
         sc_map = {"done": GREEN, "error": RED}
-        self._status_lbl.config(text=st_map.get(status, status),
+        status_text = st_map.get(status, status)
+        if status == "processing" and processing_stage:
+            status_text = f"Processing: {processing_stage}"
+        self._status_lbl.config(text=status_text,
                                 fg=sc_map.get(status, YELLOW))
 
         slug      = meta.get("slug", "")
@@ -4985,7 +5136,18 @@ class DetailPanel(tk.Frame):
         if meta.get("error") and not (bool(meta.get("summary_manual")) and str(body).strip()):
             body = "Error: " + meta["error"]
         self._set_text(self._summary_txt, body)
-        self._set_text(self._transcript_txt, meta.get("transcript", ""))
+        transcript_text = meta.get("transcript", "")
+        if status == "processing":
+            self._flow_note_var.set(processing_stage or "Saved audio is being reprocessed from disk.")
+            self.set_live_transcript(
+                transcript_text,
+                processing=True,
+                status_note=processing_stage or "Processing saved audio...",
+            )
+        else:
+            self._flow_note_var.set("Review the final transcript, then adjust the summary if needed.")
+            self._set_text(self._transcript_txt, transcript_text)
+            self._set_content_view("summary" if body.strip() else "transcript")
         self._sync_process_diagram(meta)
 
     # ── Transport ─────────────────────────────────────────────────────────────
@@ -5077,8 +5239,33 @@ class DetailPanel(tk.Frame):
             self._copy_btn.configure_button(bg="#e0f2fe", fg=FG)
             self.after(
                 800,
-                lambda: self._copy_btn.configure_button(bg=ITEM_BG, fg=FG),
+                lambda: self._copy_btn.configure_button(bg=PANEL_BG, fg=FG),
             )
+
+    def _set_content_view(self, view):
+        self._content_view = "transcript" if view == "transcript" else "summary"
+        self._refresh_content_view()
+
+    def _refresh_content_view(self):
+        if not hasattr(self, "_summary_panel"):
+            return
+        for panel in (self._summary_panel, self._transcript_panel):
+            panel.pack_forget()
+        if self._content_view == "transcript":
+            self._transcript_panel.pack(fill="both", expand=True)
+            self._summary_tab_btn.configure_button(bg=ITEM_BG, fg=FG_DIM)
+            self._transcript_tab_btn.configure_button(bg=PANEL_BG, fg=FG)
+        else:
+            self._summary_panel.pack(fill="both", expand=True)
+            self._summary_tab_btn.configure_button(bg=PANEL_BG, fg=FG)
+            self._transcript_tab_btn.configure_button(bg=ITEM_BG, fg=FG_DIM)
+        for child in self._text_action_host.winfo_children():
+            child.pack_forget()
+        if self._content_view == "transcript":
+            self._open_transcript_btn.pack(side="left")
+            self._copy_btn.pack(side="left", padx=(8, 0))
+        else:
+            self._edit_summary_btn.pack(side="left")
 
     def clear(self):
         """Reset the detail panel to the placeholder state."""
@@ -5086,6 +5273,7 @@ class DetailPanel(tk.Frame):
         self._current = None
         self._title_manual = False
         self._summary_manual = False
+        self._content_view = "summary"
         self._stop_tick()
         self._edit_summary_btn.set_enabled(False)
         self._content.pack_forget()
@@ -5098,6 +5286,8 @@ class DetailPanel(tk.Frame):
         self._open_transcript_btn.set_enabled(False)
         self._copy_btn.set_enabled(False)
         self._obsidian_btn.set_enabled(False)
+        self._flow_note_var.set("Audio capture, chunking, transcript, summary, then ready.")
+        self._refresh_content_view()
         self._set_process_nodes(audio="pending", chunks="pending", transcript="pending", summary="pending", ready="pending")
 
     def title_text(self):
@@ -5113,11 +5303,13 @@ class DetailPanel(tk.Frame):
     def apply_manual_summary(self, summary):
         self._summary_manual = True
         self._set_text(self._summary_txt, summary)
+        self._set_content_view("summary")
         if self._live_mode:
             self._set_process_nodes(summary="active" if summary.strip() else "pending")
 
     def set_live_transcript(self, text, processing=True, status_note=""):
         """Update transcript widget with live text during recording."""
+        self._set_content_view("transcript")
         w = self._transcript_txt
         w.config(state="normal")
         w.delete("1.0", "end")
@@ -5132,6 +5324,12 @@ class DetailPanel(tk.Frame):
         w.see("end")
         w.config(state="disabled")
         self._copy_btn.set_enabled(bool(text))
+        if status_note:
+            self._flow_note_var.set(status_note)
+        elif text.strip():
+            self._flow_note_var.set("Transcript is live. Summary will settle after processing.")
+        elif processing:
+            self._flow_note_var.set("Waiting for the first live chunk to land.")
         if text.strip():
             self._set_process_nodes(audio="active", chunks="done", transcript="active")
         elif processing:

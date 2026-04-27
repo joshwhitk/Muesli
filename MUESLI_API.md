@@ -122,6 +122,57 @@ Typical progress stages include:
 - Audio files are written to the configured shared directory.
 - Session metadata is stored under `recordings/` in the repo directory by default.
 
+## Likely MCP / Local Service Mapping
+
+The current Python API is also the natural base for a future local MCP or app-service layer.
+
+Core operations map roughly like this:
+
+- `record_default_mic`
+  - start a recording from the default microphone and finalize it into a local voice note
+- `transcribe_file`
+  - accept an audio file path and return transcript text without necessarily saving a note
+- `ingest_voice_note`
+  - copy or normalize an audio file into the managed Muesli store and process it like a locally recorded note
+- `list_notes` / `get_note`
+  - browse saved notes and retrieve fields such as title, summary, transcript, started-at timestamp, duration, speakers, slug, and audio path
+- `search_notes_deterministic`
+  - plain deterministic search over saved fields
+- `search_notes_llm`
+  - semantic or prompt-based search over transcript / summary / title
+- `regenerate_component`
+  - re-run summary or title generation from an existing transcript or audio-backed note
+- `overwrite_component`
+  - save corrected title / summary / transcript text back into the local note
+- `delete_note`
+  - remove a managed note and its owned local artifacts
+
+Useful component-level targets:
+
+- `audio`
+- `transcript`
+- `summary`
+- `title`
+- `started_at`
+- `duration`
+- `speakers`
+- `status`
+
+Useful metadata or control actions beyond the current desktop UI:
+
+- `get_component_size`
+- `get_component_length`
+- `get_note_status`
+- `reprocess_from_audio`
+- `export_note`
+
+What that future service layer should still add explicitly:
+
+- health / capability introspection
+- backend selection without storing secrets in shared registries
+- idempotent job submission and job IDs for long-running processing
+- provenance fields so downstream apps know whether title/summary/transcript were user-edited, AI-generated, or regenerated later
+
 ## Configuration
 
 The API reads `config.json` when present.
