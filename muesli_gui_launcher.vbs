@@ -5,8 +5,23 @@ Set shell = CreateObject("WScript.Shell")
 Randomize
 
 root = fso.GetParentFolderName(WScript.ScriptFullName)
-pythonExe = root & "\.venv\Scripts\python.exe"
-pythonwExe = root & "\.venv\Scripts\pythonw.exe"
+' Resolve venv path. Prefer the off-Dropbox install at %LOCALAPPDATA%\muesli\.venv
+' (avoids Dropbox sync interference with pip / DLL loads), but fall back to the
+' legacy in-source .venv\ for installs that haven't migrated yet. The MUESLI_VENV
+' env var overrides everything for unusual setups.
+Dim envVenv, defaultVenv, legacyVenv, venvRoot
+envVenv = shell.ExpandEnvironmentStrings("%MUESLI_VENV%")
+defaultVenv = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%\muesli\.venv")
+legacyVenv = root & "\.venv"
+If envVenv <> "%MUESLI_VENV%" And envVenv <> "" And fso.FolderExists(envVenv) Then
+    venvRoot = envVenv
+ElseIf fso.FolderExists(defaultVenv) Then
+    venvRoot = defaultVenv
+Else
+    venvRoot = legacyVenv
+End If
+pythonExe = venvRoot & "\Scripts\python.exe"
+pythonwExe = venvRoot & "\Scripts\pythonw.exe"
 guiScript = root & "\muesli_gui.py"
 bootstrapScript = root & "\muesli_gui_bootstrap.py"
 splashScript = root & "\muesli_splash.ps1"

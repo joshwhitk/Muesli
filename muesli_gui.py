@@ -95,6 +95,28 @@ LAUNCH_STATUS_PREFIX = ".launch_status_"
 LAUNCH_TRACE_PREFIX = ".launch_trace_"
 os.makedirs(REC_DIR, exist_ok=True)
 
+
+def _resolve_venv_python():
+    """Return the venv python.exe path, preferring the off-Dropbox install at
+    %LOCALAPPDATA%\\muesli\\.venv (avoids Dropbox sync interference with pip
+    and DLL loads), falling back to the legacy in-source .venv\\ for installs
+    that haven't migrated yet. MUESLI_VENV env var overrides everything.
+
+    Mirrors the resolution used in muesli_gui_launcher.vbs and
+    muesli_hotkey_launcher.vbs — keep these three in sync."""
+    candidates = []
+    env = os.environ.get("MUESLI_VENV", "").strip()
+    if env:
+        candidates.append(os.path.join(env, "Scripts", "python.exe"))
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        candidates.append(os.path.join(local_app, "muesli", ".venv", "Scripts", "python.exe"))
+    candidates.append(os.path.join(APP_DIR, ".venv", "Scripts", "python.exe"))
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return ""
+
 # ── Audio constants ───────────────────────────────────────────────────────────
 RATE     = 16000
 CHANNELS = 1
@@ -547,8 +569,8 @@ def restart_windows_hotkey_agent():
             time.sleep(0.2)
         except Exception:
             pass
-    target = os.path.join(APP_DIR, ".venv", "Scripts", "python.exe")
-    if not os.path.exists(target):
+    target = _resolve_venv_python()
+    if not target or not os.path.exists(target):
         return
     subprocess.Popen(
         [target, HOTKEY_AGENT_SCRIPT],

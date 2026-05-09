@@ -13,11 +13,23 @@ This repo is currently maintained as a practical tool, so the most useful contri
 
 ### Windows
 
+**Use Python 3.12 or 3.13.** Python 3.14 is not yet supported by `faster-whisper` 1.2.1 (its install hangs on Windows + 3.14 — see [SYSTRAN/faster-whisper#1404](https://github.com/SYSTRAN/faster-whisper/issues/1404)) or by `llama-cpp-python` (no cp314 wheels yet).
+
+**Install the venv outside the source tree.** When the venv lives inside the Dropbox-synced source tree, Dropbox's "Pinned" attribute on `.venv\` interferes with pip writes, package deletes, and DLL loads. The launchers (`muesli_gui_launcher.vbs`, `muesli_hotkey_launcher.vbs`) and `muesli_gui.py` resolve the venv in this order:
+
+1. `MUESLI_VENV` env var (escape hatch)
+2. `%LOCALAPPDATA%\muesli\.venv\` ← **recommended default**
+3. `<source>\.venv\` (legacy, still works for old installs)
+
 ```powershell
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+# Off-Dropbox venv (recommended)
+$venv = "$env:LOCALAPPDATA\muesli\.venv"
+py -3.12 -m venv $venv
+& "$venv\Scripts\python.exe" -m pip install --upgrade pip
+& "$venv\Scripts\python.exe" -m pip install -r requirements.txt
 ```
+
+`llama-cpp-python` is optional (Muesli falls back to Anthropic / Ollama for summarisation). On Windows it currently builds from source and trips long-path limits — install it separately only if you need local GGUF inference.
 
 ### Linux
 

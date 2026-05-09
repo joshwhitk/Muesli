@@ -89,6 +89,9 @@ shell32 = ctypes.windll.shell32
 kernel32 = ctypes.windll.kernel32
 gdi32 = ctypes.windll.gdi32
 LRESULT = getattr(wintypes, "LRESULT", wintypes.LPARAM)
+# wintypes.HCURSOR is only present on Python 3.13+. typedef HCURSOR = HANDLE
+# at the Win32 level, so substitute on older Python.
+HCURSOR = getattr(wintypes, "HCURSOR", wintypes.HANDLE)
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
 
@@ -129,7 +132,7 @@ class WNDCLASSW(ctypes.Structure):
         ("cbWndExtra", ctypes.c_int),
         ("hInstance", wintypes.HINSTANCE),
         ("hIcon", wintypes.HICON),
-        ("hCursor", wintypes.HCURSOR),
+        ("hCursor", HCURSOR),
         ("hbrBackground", wintypes.HBRUSH),
         ("lpszMenuName", wintypes.LPCWSTR),
         ("lpszClassName", wintypes.LPCWSTR),
