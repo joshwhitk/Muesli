@@ -724,7 +724,12 @@ check("GUI launcher uses the bootstrap entrypoint and explicit PowerShell path f
       'tracePath = root & "\\.launch_trace_" & token & ".log"' in launcher_source and
       'AppendTrace("python_launch_requested"' in launcher_source)
 check("GUI launcher prefers pythonw for the normal hidden app launch path",
-      'pythonwExe = root & "\\.venv\\Scripts\\pythonw.exe"' in launcher_source and
+      # The exact path string changed when the venv resolution was rewritten
+      # (now derived from venvRoot which prefers %LOCALAPPDATA%\muesli\.venv
+      # over the in-source .venv\), but the pythonw-preference logic itself
+      # is unchanged: define pythonwExe, default to pythonExe, then upgrade
+      # to pythonwExe only if it exists.
+      'pythonwExe = venvRoot & "\\Scripts\\pythonw.exe"' in launcher_source and
       'selectedPython = pythonExe' in launcher_source and
       'If fso.FileExists(pythonwExe) Then' in launcher_source and
       'selectedPython = pythonwExe' in launcher_source)
