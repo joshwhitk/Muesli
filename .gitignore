@@ -6,10 +6,16 @@ models/*.gguf
 
 # User data
 recordings/
+recordings_quarantine/
 outputs/
 .tmp/
 prompt.txt
 *.pid
+
+# Per-launch trace + status artifacts (transient)
+.launch_status_*.json
+.launch_trace_*.log
+runtime_state.json
 
 # Python
 .venv/

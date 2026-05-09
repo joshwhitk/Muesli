@@ -30,7 +30,8 @@ except ImportError:
     sd = None
 
 # ── Paths & constants ────────────────────────────────────────────────────────
-APP_DIR     = os.environ.get("MUESLI_HOME") or os.path.dirname(os.path.abspath(__file__))
+from paths import APP_DIR, CHUNK_DIR
+from muesli_runtime import wait_for_processing_resume as _wait_for_processing_resume
 REC_DIR     = os.path.join(APP_DIR, "recordings")
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 PROMPT_FILE = os.path.join(APP_DIR, "prompt.txt")
@@ -436,6 +437,20 @@ def _load_recording(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def _write_note_sidecar(shared_dir, slug, title, summary, corrections, bugs, transcript):
+    txt_path = os.path.join(shared_dir, slug + ".txt")
+    txt_body = f"# {title}\n\n"
+    if summary:
+        txt_body += f"## Summary\n\n{summary}\n\n"
+    if corrections:
+        txt_body += f"## Transcription Corrections\n\n{corrections}\n\n"
+    if bugs:
+        txt_body += f"## Bugs / Issues Mentioned\n\n{bugs}\n\n"
+    txt_body += f"## Transcript\n\n{transcript}\n"
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(txt_body)
 
 
 def _ffmpeg_available():
@@ -1101,7 +1116,7 @@ class Muesli:
 
     def _emit_chunk(self, frames):
         self._chunk_idx += 1
-        path = os.path.join(REC_DIR, f"{self._rec_slug}_chunk{self._chunk_idx}.wav")
+        path = os.path.join(CHUNK_DIR, f"{self._rec_slug}_chunk{self._chunk_idx}.wav")
         wf = wave.open(path, "wb")
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(self._sample_width)
@@ -1261,17 +1276,15 @@ class Muesli:
                     break
 
         # Write markdown transcript
-        txt_path = os.path.join(self._shared_dir, new_slug + ".txt")
-        txt_body = f"# {title}\n\n"
-        if summary:
-            txt_body += f"## Summary\n\n{summary}\n\n"
-        if corrections:
-            txt_body += f"## Transcription Corrections\n\n{corrections}\n\n"
-        if bugs:
-            txt_body += f"## Bugs / Issues Mentioned\n\n{bugs}\n\n"
-        txt_body += f"## Transcript\n\n{transcript}\n"
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(txt_body)
+        _write_note_sidecar(
+            self._shared_dir,
+            new_slug,
+            title,
+            summary,
+            corrections,
+            bugs,
+            transcript,
+        )
 
         # Remove old metadata if slug changed
         old_json = os.path.join(REC_DIR, slug + ".json")
@@ -1292,6 +1305,7 @@ class Muesli:
             "summary_mode_title": active_summary_mode["title"],
         })
         meta.pop("error", None)
+        meta.pop("processing_stage", None)
         _save_meta(meta)
         return meta
 
@@ -1364,12 +1378,19 @@ class Muesli:
             if on_percent:
                 on_percent(100)
             return transcript
+        # Honor a pause set via the GUI tray, HTTP /processing/pause, or MCP
+        # pause_processing tool. Block before doing the heavy GPU work.
+        _wait_for_processing_resume()
         segments, info = _transcribe_segments(audio_file_path, beam_size=5)
         total_duration = info.duration if info.duration else 0
         collected = []
         last_pct = -1
         for seg in segments:
             collected.append(seg)
+            # Re-check the pause flag between segments so a long transcribe can
+            # be paused mid-flight. Adds at most a single load_runtime_state
+            # read per segment and only blocks when paused.
+            _wait_for_processing_resume()
             if on_percent and total_duration > 0:
                 pct = min(int(seg.end / total_duration * 100), 99)
                 if pct != last_pct:
@@ -1442,17 +1463,15 @@ class Muesli:
                     os.rename(old_audio, new_audio)
                     break
 
-        txt_path = os.path.join(self._shared_dir, new_slug + ".txt")
-        txt_body = f"# {title}\n\n"
-        if summary:
-            txt_body += f"## Summary\n\n{summary}\n\n"
-        if corrections:
-            txt_body += f"## Transcription Corrections\n\n{corrections}\n\n"
-        if bugs:
-            txt_body += f"## Bugs / Issues Mentioned\n\n{bugs}\n\n"
-        txt_body += f"## Transcript\n\n{transcript}\n"
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(txt_body)
+        _write_note_sidecar(
+            self._shared_dir,
+            new_slug,
+            title,
+            summary,
+            corrections,
+            bugs,
+            transcript,
+        )
 
         old_txt = os.path.join(self._shared_dir, slug + ".txt")
         if new_slug != slug and os.path.exists(old_txt):
@@ -1476,6 +1495,7 @@ class Muesli:
             "summary_mode_title": mode_title or mode["title"],
         })
         meta.pop("error", None)
+        meta.pop("processing_stage", None)
         _save_meta(meta)
         return meta
 
@@ -1493,6 +1513,11 @@ class Muesli:
         results.sort(key=lambda m: m.get("started_at", ""), reverse=True)
         return results
 
+    def get_latest_session(self):
+        """Return the newest saved session, or None."""
+        sessions = self.list_sessions()
+        return sessions[0] if sessions else None
+
     def get_session(self, slug):
         """Load a single session by slug. Returns dict or None."""
         path = os.path.join(REC_DIR, slug + ".json")
@@ -1500,6 +1525,106 @@ class Muesli:
         if m:
             m["audio_path"] = self.audio_path(slug)
         return m
+
+    def search_sessions(self, query, component="any", limit=20):
+        """Deterministically search saved sessions by substring match."""
+        needle = str(query or "").strip().lower()
+        component = str(component or "any").strip().lower()
+        valid_components = {"any", "title", "summary", "transcript", "date", "status"}
+        if component not in valid_components:
+            component = "any"
+        results = []
+        for meta in self.list_sessions():
+            fields = {
+                "title": str(meta.get("title") or ""),
+                "summary": str(meta.get("summary") or ""),
+                "transcript": str(meta.get("transcript") or ""),
+                "date": str(meta.get("started_at") or ""),
+                "status": str(meta.get("status") or ""),
+            }
+            haystacks = fields.values() if component == "any" else (fields[component],)
+            if needle and not any(needle in value.lower() for value in haystacks):
+                continue
+            match_text = next((value for value in haystacks if needle and needle in value.lower()), fields["title"])
+            excerpt = (match_text or "").strip()
+            if excerpt and len(excerpt) > 180:
+                excerpt = excerpt[:177].rstrip() + "..."
+            enriched = dict(meta)
+            enriched["match_component"] = component
+            enriched["match_excerpt"] = excerpt
+            results.append(enriched)
+            if len(results) >= max(1, int(limit or 20)):
+                break
+        return results
+
+    def overwrite_session(self, slug, **updates):
+        """Overwrite stored note fields and keep the sidecar in sync."""
+        meta = self.get_session(slug)
+        if not meta:
+            raise FileNotFoundError(f"No session found for slug {slug}")
+
+        allowed = {
+            "title",
+            "summary",
+            "transcript",
+            "started_at",
+            "status",
+            "duration",
+            "speakers",
+            "corrections",
+            "bugs",
+        }
+        changed = False
+        for key, value in updates.items():
+            if key not in allowed:
+                continue
+            meta[key] = value
+            changed = True
+
+        if not changed:
+            return meta
+
+        if "title" in updates:
+            meta["title_manual"] = True
+        if "summary" in updates:
+            meta["summary_manual"] = True
+        if "transcript" in updates and "status" not in updates:
+            meta["status"] = "done"
+
+        _save_meta(meta)
+        _write_note_sidecar(
+            self._shared_dir,
+            slug,
+            str(meta.get("title") or _default_session_title(meta.get("started_at", ""))),
+            str(meta.get("summary") or ""),
+            str(meta.get("corrections") or ""),
+            str(meta.get("bugs") or ""),
+            str(meta.get("transcript") or ""),
+        )
+        meta["audio_path"] = self.audio_path(slug)
+        return meta
+
+    def delete_session(self, slug):
+        """Delete a saved session and its owned local artifacts."""
+        meta = self.get_session(slug)
+        if not meta:
+            return False
+
+        for ext in (".mp3", ".wav", ".txt"):
+            path = os.path.join(self._shared_dir, slug + ext)
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        for ext in (".json", ".wav"):
+            path = os.path.join(REC_DIR, slug + ext)
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        return True
 
     def audio_path(self, slug):
         """Return path to the audio file (MP3 preferred, WAV fallback), or None."""

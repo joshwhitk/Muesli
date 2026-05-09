@@ -68,9 +68,9 @@ _single_instance_handle = None
 IS_WIN = platform.system() == "Windows"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-APP_DIR      = os.environ.get("MUESLI_HOME") or os.path.dirname(os.path.abspath(__file__))
+from paths import APP_DIR, CHUNK_DIR
 ASSETS_DIR   = os.path.join(APP_DIR, "assets")
-REC_DIR      = os.path.join(APP_DIR, "recordings")   # JSON metadata
+REC_DIR      = os.path.join(APP_DIR, "recordings")   # JSON metadata + final WAVs
 CONFIG_FILE  = os.path.join(APP_DIR, "config.json")
 PROMPT_FILE  = os.path.join(APP_DIR, "prompt.txt")
 ICON_PNG     = os.path.join(ASSETS_DIR, "muesli-icon.png")
@@ -234,12 +234,11 @@ def _launch_token_from_argv(argv=None):
     return ""
 
 
-def is_processing_paused():
-    return bool(load_runtime_state().get("processing_paused", False))
-
-
-def set_processing_paused(paused):
-    update_runtime_state(processing_paused=bool(paused))
+from muesli_runtime import (
+    is_processing_paused,
+    set_processing_paused,
+    wait_for_processing_resume as _wait_for_processing_resume_runtime,
+)
 
 
 def _pid_alive(pid):
@@ -280,8 +279,7 @@ def _release_single_instance():
 
 
 def _wait_for_processing_resume():
-    while is_processing_paused():
-        time.sleep(0.25)
+    _wait_for_processing_resume_runtime()
 
 
 def _apply_windows_app_identity():
@@ -353,6 +351,10 @@ def _normalize_config(cfg):
     normalized["audio_input_device"] = str(normalized.get("audio_input_device", "")).strip()
     normalized["obsidian_vault_dir"] = str(normalized.get("obsidian_vault_dir", "")).strip()
     normalized["obsidian_export_folder"] = str(normalized.get("obsidian_export_folder", "Muesli")).strip() or "Muesli"
+    # Auto-export defaults to True so Obsidian is the default note destination —
+    # the obsidian-export-default task in STATUS.MD. The export still no-ops
+    # safely when no vault is configured.
+    normalized["obsidian_auto_export"] = bool(normalized.get("obsidian_auto_export", True))
     legacy_prompt = _read_legacy_prompt() if "summary_modes" not in normalized else ""
     normalized["summary_modes"] = _coerce_summary_modes(normalized.get("summary_modes"), legacy_prompt)
     active_mode = str(normalized.get("active_summary_mode") or SUMMARY_MODE_GENERAL_ID).strip().lower()
@@ -822,6 +824,7 @@ def open_settings_dialog(master):
     ollama_model = tk.StringVar(value=cfg.get("ollama_model", _recommend_ollama_model(ollama_models) or ""))
     obsidian_vault_dir = tk.StringVar(value=cfg.get("obsidian_vault_dir", ""))
     obsidian_export_folder = tk.StringVar(value=cfg.get("obsidian_export_folder", "Muesli"))
+    obsidian_auto_export = tk.BooleanVar(value=bool(cfg.get("obsidian_auto_export", True)))
     input_backend = _preferred_recording_backend()
     input_devices = _list_audio_input_devices(input_backend)
     configured_backend = cfg.get("audio_input_backend", "auto")
@@ -1088,7 +1091,19 @@ def open_settings_dialog(master):
         min_width=90,
     ).pack(side="left", padx=(10, 0))
     tk.Label(obsidian_frame, text="Export subfolder inside the vault", bg=PANEL_BG, fg=FG_DIM, font=FONT_SM).pack(anchor="w", padx=14)
-    tk.Entry(obsidian_frame, textvariable=obsidian_export_folder, font=FONT_SM, relief="flat", bd=0).pack(fill="x", padx=14, pady=(4, 12), ipady=6)
+    tk.Entry(obsidian_frame, textvariable=obsidian_export_folder, font=FONT_SM, relief="flat", bd=0).pack(fill="x", padx=14, pady=(4, 6), ipady=6)
+    tk.Checkbutton(
+        obsidian_frame,
+        text="Auto-export every finished recording to Obsidian",
+        variable=obsidian_auto_export,
+        bg=PANEL_BG,
+        fg=FG,
+        selectcolor=PANEL_BG,
+        activebackground=PANEL_BG,
+        activeforeground=FG,
+        font=FONT_SM,
+        anchor="w",
+    ).pack(fill="x", padx=14, pady=(0, 12))
 
     buttons = tk.Frame(dialog, bg=DARK_BG)
     buttons.pack(fill="x", padx=18, pady=(4, 18))
@@ -1111,6 +1126,7 @@ def open_settings_dialog(master):
             updated["audio_input_device"] = selected_input.get("id", "")
         updated["obsidian_vault_dir"] = obsidian_vault_dir.get().strip()
         updated["obsidian_export_folder"] = obsidian_export_folder.get().strip() or "Muesli"
+        updated["obsidian_auto_export"] = bool(obsidian_auto_export.get())
         save_config(updated)
         saved["ok"] = True
         dialog.destroy()
@@ -1439,8 +1455,71 @@ def _parse_ai_response(raw):
     return json.loads(text)
 
 
+# Long-transcript summarization: above this character threshold we map-reduce
+# the transcript into a per-window brief, then run the real prompt over the
+# briefs. This stops the LLM from latching onto whatever happened to be at the
+# end of the transcript (the documented HDX failure where a 90-minute kickoff
+# was summarised as "NeoCities + indie developer MVP timing").
+LONG_TRANSCRIPT_THRESHOLD_CHARS = 6000
+LONG_TRANSCRIPT_WINDOW_CHARS = 3000
+LONG_TRANSCRIPT_WINDOW_OVERLAP_CHARS = 200
+LONG_TRANSCRIPT_BRIEF_PROMPT = (
+    "You are summarising one excerpt from a longer transcript. Write a single "
+    "neutral paragraph (3-6 sentences) covering only what is actually discussed "
+    "in this excerpt. Do not invent context or speculate about other parts of "
+    "the conversation. Return plain text only.\n\nExcerpt:\n{transcript}\n"
+)
+
+
+def _split_transcript_for_map_reduce(transcript,
+                                     window=LONG_TRANSCRIPT_WINDOW_CHARS,
+                                     overlap=LONG_TRANSCRIPT_WINDOW_OVERLAP_CHARS):
+    text = (transcript or "").strip()
+    if not text:
+        return []
+    if len(text) <= window:
+        return [text]
+    chunks = []
+    step = max(1, window - overlap)
+    for start in range(0, len(text), step):
+        chunks.append(text[start:start + window])
+        if start + window >= len(text):
+            break
+    return chunks
+
+
+def _summarize_long_transcript_via_map_reduce(transcript, ollama_timeout=None):
+    """Return a condensed transcript built from per-window briefs. The caller
+    then feeds the condensed text into the normal summary prompt."""
+    chunks = _split_transcript_for_map_reduce(transcript)
+    briefs = []
+    for idx, chunk in enumerate(chunks, start=1):
+        prompt = LONG_TRANSCRIPT_BRIEF_PROMPT.replace("{transcript}", chunk)
+        try:
+            raw = _llm_generate(prompt, ollama_timeout=ollama_timeout)
+        except Exception:
+            raw = ""
+        brief = (raw or "").strip()
+        if brief:
+            briefs.append(f"[Excerpt {idx} brief]\n{brief}")
+    if not briefs:
+        # If every brief failed, fall back to truncating the transcript so the
+        # final prompt at least sees the whole-conversation arc, not just the
+        # recency-biased tail.
+        return transcript[: LONG_TRANSCRIPT_THRESHOLD_CHARS]
+    return "\n\n".join(briefs)
+
+
 def _generate_ai_fields(transcript, ollama_timeout=None):
-    prompt_text = get_summary_prompt().replace("{transcript}", transcript or "")
+    text = transcript or ""
+    if len(text) > LONG_TRANSCRIPT_THRESHOLD_CHARS:
+        # Map-reduce: condense long transcripts into per-window briefs first so
+        # the final summary prompt sees a balanced view of the conversation
+        # instead of being recency-biased to whatever was at the end.
+        condensed = _summarize_long_transcript_via_map_reduce(text, ollama_timeout=ollama_timeout)
+        prompt_text = get_summary_prompt().replace("{transcript}", condensed)
+    else:
+        prompt_text = get_summary_prompt().replace("{transcript}", text)
     try:
         ai = _parse_ai_response(_llm_generate(prompt_text, ollama_timeout=ollama_timeout))
         if not isinstance(ai, dict):
@@ -2588,7 +2667,7 @@ class Recorder:
 
     def _emit_chunk(self, frames):
         self._chunk_idx += 1
-        path = os.path.join(REC_DIR, f"{self._slug}_chunk{self._chunk_idx}.wav")
+        path = os.path.join(CHUNK_DIR, f"{self._slug}_chunk{self._chunk_idx}.wav")
         wf = wave.open(path, "wb")
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(self._sample_width)
@@ -3485,30 +3564,50 @@ class MuesliApp(tk.Tk):
                 os.unlink(_SOCK_PATH)
         except Exception:
             pass
-        # Clean up leftover chunk WAV files
-        for f in os.listdir(REC_DIR):
-            if "_chunk" in f and f.endswith(".wav"):
-                try:
-                    os.remove(os.path.join(REC_DIR, f))
-                except OSError:
-                    pass
-        update_runtime_state(
-            app_pid=None,
-            recording=False,
-            processing=False,
-            status="Idle",
-        )
+        # Clean up leftover chunk WAV files. Anything that fails here must not
+        # block self.destroy(), or the X button appears to do nothing.
+        try:
+            for f in os.listdir(CHUNK_DIR):
+                if f.endswith(".wav"):
+                    try:
+                        os.remove(os.path.join(CHUNK_DIR, f))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        try:
+            update_runtime_state(
+                app_pid=None,
+                recording=False,
+                processing=False,
+                status="Idle",
+            )
+        except Exception:
+            pass
         self.destroy()
 
     def _cleanup_stale(self):
         """On launch, clean up chunk WAVs and mark interrupted sessions for resume."""
         # Clean up chunk WAVs
-        for f in os.listdir(REC_DIR):
-            if "_chunk" in f and f.endswith(".wav"):
-                try:
-                    os.remove(os.path.join(REC_DIR, f))
-                except OSError:
-                    pass
+        try:
+            for f in os.listdir(CHUNK_DIR):
+                if f.endswith(".wav"):
+                    try:
+                        os.remove(os.path.join(CHUNK_DIR, f))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        # Sweep any legacy chunk files left behind in REC_DIR by older builds.
+        try:
+            for f in os.listdir(REC_DIR):
+                if "_chunk" in f and f.endswith(".wav"):
+                    try:
+                        os.remove(os.path.join(REC_DIR, f))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
         # Find interrupted sessions and flip them to "processing" so the list
         # shows ⟳ instead of ✗ while they're being resumed
         self._interrupted = []
@@ -4254,12 +4353,41 @@ class MuesliApp(tk.Tk):
         if not self._recording: self._start_recording()
         else:                   self._stop_recording()
 
+    def _apply_recording_state(self, active, status_text=None):
+        """Single source of truth for recording-state UI. Updates _recording flag,
+        button text/colors, taskbar icon, and status_var atomically so the CTA
+        and the status text can never disagree (the symptom of the
+        recording-cta-status-consistency bug)."""
+        self._recording = bool(active)
+        if active:
+            self._rec_btn.configure_button(
+                text="Stop Recording",
+                bg="#111827",
+                fg="white",
+                active_bg="#1f2937",
+                shadow="#c7d0db",
+            )
+            self.wm_iconphoto(True, self._icon_rec)
+            if status_text is None:
+                status_text = "Recording..."
+        else:
+            self._rec_btn.configure_button(
+                text="Start Recording",
+                bg=RED,
+                fg="white",
+                active_bg="#b42318",
+                shadow="#e8b3b3",
+            )
+            self.wm_iconphoto(True, self._icon_idle)
+            if status_text is None:
+                status_text = "Ready"
+        self._status_var.set(status_text)
+
     def _start_recording(self):
         if not self._recording_available:
             messagebox.showerror("Recording unavailable", "PyAudio is not installed, so microphone recording is disabled on this PC.")
             return
         self._player.stop()
-        self._recording = True
         self._live_transcript = ""
         self._live_chunks_transcribed = 0
         self._live_preview = None
@@ -4300,16 +4428,16 @@ class MuesliApp(tk.Tk):
                     lambda nn=n, gen=live_generation: self._on_chunk_summarised(gen, nn))
             )
             recorder_on_chunk = self._chunk_pipeline.submit
-        self._live_recording_slug = self._recorder.start(on_chunk=recorder_on_chunk, on_frame=recorder_on_frame)
-        self._rec_btn.configure_button(
-            text="Stop Recording",
-            bg="#111827",
-            fg="white",
-            active_bg="#1f2937",
-            shadow="#c7d0db",
-        )
-        self.wm_iconphoto(True, self._icon_rec)
-        self._status_var.set("Recording...")
+        try:
+            self._live_recording_slug = self._recorder.start(on_chunk=recorder_on_chunk, on_frame=recorder_on_frame)
+        except Exception as exc:
+            # Recorder failed to start — leave UI in the resting "Start Recording" state
+            # so CTA and status agree. Without this, _recording would stay True (set by an
+            # earlier draft) while the button still showed "Start Recording".
+            self._apply_recording_state(False, status_text=f"Could not start recording: {exc}")
+            return
+        # Starts succeeded; flip the UI state in one atomic step.
+        self._apply_recording_state(True, status_text="Recording...")
         # Show the detail panel immediately for live transcript display
         self._detail.show_live()
         self._detail.set_live_transcript("", processing=True, status_note=self._live_transcript_status())
@@ -4531,19 +4659,10 @@ class MuesliApp(tk.Tk):
         self._timer_id = self.after(500, self._tick_timer)
 
     def _stop_recording(self):
-        self._recording = False
+        self._apply_recording_state(False, status_text="Finishing processing...")
         if self._timer_id: self.after_cancel(self._timer_id)
         self._timer_id = None
         self._timer_lbl.config(text="")
-        self._rec_btn.configure_button(
-            text="Start Recording",
-            bg=RED,
-            fg="white",
-            active_bg="#b42318",
-            shadow="#e8b3b3",
-        )
-        self.wm_iconphoto(True, self._icon_idle)
-        self._status_var.set("Finishing processing...")
         self.update_idletasks()
 
         meta = self._recorder.stop()
@@ -4559,12 +4678,25 @@ class MuesliApp(tk.Tk):
         self._listbox.selection_clear(0, "end")
         self._listbox.selection_set(0)
         self._cur_meta = meta
+        # Capture the strongest available transcript snapshot BEFORE show(meta)
+        # blanks the widget. _live_transcript is updated on each chunk/realtime
+        # callback, but in realtime mode it can briefly lag _realtime_turns if
+        # the latest delta is queued on the Tk main loop. Fall back to
+        # composing from turns directly so we never blank a recording that
+        # had visible transcript moments ago.
+        preserved_transcript = self._live_transcript
+        if not preserved_transcript and self._use_openai_realtime():
+            preserved_transcript = self._compose_realtime_transcript()
         self._detail.show(meta)
         self._render_summary_mode_buttons()
-        # Restore the live transcript that show(meta) just cleared
-        if self._live_transcript:
-            self._detail.set_live_transcript(
-                self._live_transcript, processing=True, status_note=self._live_transcript_status(finalising=True))
+        # Always restore the preserved transcript (even if empty — the status_note
+        # still tells the user finalisation is running). Dropping the old
+        # `if self._live_transcript:` gate is what fixes the stop-blanks-transcript bug.
+        self._detail.set_live_transcript(
+            preserved_transcript,
+            processing=True,
+            status_note=self._live_transcript_status(finalising=True),
+        )
         self._detail.set_live_overview(
             title=meta_title(meta),
             summary="Final summary and rename will appear when processing completes.",
@@ -4619,6 +4751,26 @@ class MuesliApp(tk.Tk):
                         self._listbox.selection_clear(0, "end")
                         self._listbox.selection_set(i)
                         break
+                # Auto-export to Obsidian when enabled (default ON per the
+                # obsidian-export-default task). Failures are surfaced in the
+                # status bar but never block the rest of the done-flow.
+                self._maybe_auto_export_to_obsidian(meta)
+
+    def _maybe_auto_export_to_obsidian(self, meta):
+        cfg = load_config()
+        if not cfg.get("obsidian_auto_export", True):
+            return
+        if not cfg.get("obsidian_vault_dir", "").strip():
+            # Vault not configured yet — silently skip rather than nag every
+            # finished recording. The manual Export button still surfaces the
+            # picker on demand.
+            return
+        try:
+            note_path = _export_session_to_obsidian(meta, cfg)
+        except Exception as exc:
+            self._status_var.set(f"Auto-export to Obsidian failed: {exc}")
+            return
+        self._status_var.set(f"Auto-exported to Obsidian: {os.path.basename(note_path)}")
 
     def _delete_current(self):
         """Delete the currently selected recording and refresh the UI."""

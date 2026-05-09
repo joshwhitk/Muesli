@@ -8,9 +8,7 @@ import json
 import os
 import tempfile
 
-
-APP_DIR = os.environ.get("MUESLI_HOME") or os.path.dirname(os.path.abspath(__file__))
-RUNTIME_STATE_FILE = os.path.join(APP_DIR, "runtime_state.json")
+from paths import RUNTIME_DIR, RUNTIME_STATE_FILE
 
 
 def _default_state():
@@ -43,7 +41,7 @@ def save_runtime_state(state):
     payload = _default_state()
     payload.update(state or {})
     payload["updated_at"] = datetime.datetime.now().isoformat()
-    fd, tmp_path = tempfile.mkstemp(prefix="muesli-runtime-", suffix=".tmp", dir=APP_DIR)
+    fd, tmp_path = tempfile.mkstemp(prefix="muesli-runtime-", suffix=".tmp", dir=RUNTIME_DIR)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -65,3 +63,29 @@ def update_runtime_state(**changes):
 
 def reset_runtime_state():
     return save_runtime_state(_default_state())
+
+
+# ── Pause / resume ───────────────────────────────────────────────────────────
+# Centralised here (not in muesli_gui.py) so muesli.py, muesli_service.py and
+# any other worker can respect a pause without depending on the GUI module.
+
+def is_processing_paused():
+    return bool(load_runtime_state().get("processing_paused", False))
+
+
+def set_processing_paused(paused):
+    update_runtime_state(processing_paused=bool(paused))
+    return bool(paused)
+
+
+def wait_for_processing_resume(poll_interval=0.25, sleep_fn=None):
+    """Block while pause is set. sleep_fn is the time.sleep injection point
+    so tests can verify the loop runs without actually sleeping."""
+    if sleep_fn is None:
+        import time as _time
+        sleep_fn = _time.sleep
+    waited = False
+    while is_processing_paused():
+        waited = True
+        sleep_fn(poll_interval)
+    return waited

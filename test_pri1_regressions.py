@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Standalone regression tests for the 2026-05-09 Pri1 batch.
+
+Designed to NOT trigger the heavy import chain (faster-whisper, llama-cpp,
+ctranslate2, pygame mixer, etc.). On this PC those imports can take many
+minutes or wedge entirely (documented in bugs.md as the [5] transcribe
+stall). Avoiding them gives us a fast, deterministic gate for the Pri1 fixes.
+
+Strategy:
+  * Source-text assertions cover the structural changes (helper exists,
+    old buggy pattern is gone, new code paths are wired in).
+  * Functional assertions only use modules that don't pull in the heavy
+    chain — `muesli_runtime` (pure stdlib I/O) and `muesli_hotkey` (Win32
+    ctypes only, no media imports). These exercise the actual code paths
+    for the ICO encoder and the pause-flag round-trip.
+
+The same structural checks live in test_muesli.py [17] for the long-form
+suite — keep them in sync if you change one.
+"""
+
+from __future__ import annotations
+
+import atexit
+import os
+import shutil
+import struct
+import sys
+import tempfile
+
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_HOME = tempfile.mkdtemp(prefix="muesli-pri1-test-home-")
+os.makedirs(os.path.join(TEST_HOME, "shared_audio"), exist_ok=True)
+os.environ["MUESLI_HOME"] = TEST_HOME
+os.environ["MUESLI_RUNTIME_DIR"] = os.path.join(TEST_HOME, "runtime")
+os.makedirs(os.environ["MUESLI_RUNTIME_DIR"], exist_ok=True)
+atexit.register(lambda: shutil.rmtree(TEST_HOME, ignore_errors=True))
+sys.path.insert(0, REPO_DIR)
+
+# Light imports only — these do NOT pull in whisper / llama / pygame.
+import muesli_runtime
+import muesli_hotkey
+
+PASS = 0
+FAIL = 0
+
+
+def check(name, condition, detail=""):
+    global PASS, FAIL
+    if condition:
+        PASS += 1
+        print(f"  OK  {name}")
+    else:
+        FAIL += 1
+        print(f"  FAIL  {name}  {detail}")
+
+
+def read(name):
+    return open(os.path.join(REPO_DIR, name), encoding="utf-8").read()
+
+
+gui_src = read("muesli_gui.py")
+muesli_src = read("muesli.py")
+service_src = read("muesli_service.py")
+mcp_src = read("muesli_mcp.py")
+runtime_src = read("muesli_runtime.py")
+
+print("=== Pri1 regression suite ===\n")
+
+
+# ── 17a. recording-cta-status-consistency ────────────────────────────────────
+print("[17a] recording-cta-status-consistency")
+check("CTA helper _apply_recording_state is defined",
+      "def _apply_recording_state" in gui_src)
+helper_start = gui_src.find("def _apply_recording_state")
+helper_block = gui_src[helper_start:helper_start + 2000]
+check("CTA helper updates _recording, _rec_btn, and _status_var atomically",
+      "self._recording" in helper_block and "self._rec_btn.configure_button" in helper_block
+      and "self._status_var.set" in helper_block)
+check("_start_recording resets state when recorder.start raises",
+      "self._apply_recording_state(False, status_text=" in gui_src
+      and "Could not start recording" in gui_src)
+check("_stop_recording delegates to _apply_recording_state",
+      "self._apply_recording_state(False, status_text=\"Finishing processing" in gui_src)
+# The piecemeal updates the helper replaces should be gone from _start_recording.
+old_pattern_count = gui_src.count('text="Stop Recording",')
+check("piecemeal `text=\"Stop Recording\"` configure_button calls are consolidated",
+      old_pattern_count <= 1,
+      detail=f"count={old_pattern_count} (expected 1, in the helper)")
+
+
+# ── 17b. transcript-visible-after-stop ───────────────────────────────────────
+print("\n[17b] transcript-visible-after-stop")
+check("preserved-transcript fallback exists in _stop_recording",
+      "preserved_transcript = self._live_transcript" in gui_src
+      and "self._compose_realtime_transcript()" in gui_src)
+check("the old `if self._live_transcript:` gate is gone from _stop_recording",
+      "if self._live_transcript:\n            self._detail.set_live_transcript" not in gui_src)
+
+
+# ── 17c. tray-desktop-live-icons ─────────────────────────────────────────────
+print("\n[17c] tray-desktop-live-icons")
+ico_dir = tempfile.mkdtemp(prefix="muesli-pri1-test-ico-")
+try:
+    ico_path = os.path.join(ico_dir, "rec.ico")
+    muesli_hotkey.write_recording_icon(ico_path, size=16, force=True)
+    ico_bytes = open(ico_path, "rb").read()
+    check("recording-icon ICO file is created", os.path.exists(ico_path))
+    check("ICONDIR header is well-formed (reserved=0, type=1, count=1)",
+          ico_bytes[:6] == struct.pack("<HHH", 0, 1, 1))
+    ico_w, ico_h, _, _, planes, bits, byte_size, offset = struct.unpack(
+        "<BBBBHHII", ico_bytes[6:22])
+    check("ICONDIRENTRY reports 16x16, 32bpp, 1 plane",
+          ico_w == 16 and ico_h == 16 and planes == 1 and bits == 32,
+          detail=f"w={ico_w} h={ico_h} planes={planes} bits={bits}")
+    check("ICONDIRENTRY image offset and size point inside the file",
+          offset + byte_size == len(ico_bytes))
+    dib_height = struct.unpack("<i", ico_bytes[offset + 8:offset + 12])[0]
+    check("BITMAPINFOHEADER height is 2x image height (XOR + AND mask convention)",
+          dib_height == 32, detail=f"dib_height={dib_height}")
+    check("write_recording_icon is idempotent without force",
+          muesli_hotkey.write_recording_icon(ico_path, size=16) == ico_path
+          and open(ico_path, "rb").read() == ico_bytes)
+finally:
+    shutil.rmtree(ico_dir, ignore_errors=True)
+# Tray refresh swaps icons based on recording state.
+check("_refresh_tray picks _icon_recording when state.recording is true",
+      "state.get(\"recording\", False)" in read("muesli_hotkey.py")
+      and "self._icon_recording" in read("muesli_hotkey.py"))
+
+
+# ── 17d. long-transcript-summary-quality ─────────────────────────────────────
+print("\n[17d] long-transcript-summary-quality")
+check("LONG_TRANSCRIPT_THRESHOLD_CHARS is defined",
+      "LONG_TRANSCRIPT_THRESHOLD_CHARS" in gui_src)
+check("_split_transcript_for_map_reduce is defined",
+      "def _split_transcript_for_map_reduce" in gui_src)
+check("_summarize_long_transcript_via_map_reduce is defined",
+      "def _summarize_long_transcript_via_map_reduce" in gui_src)
+check("_generate_ai_fields branches on transcript length",
+      "len(text) > LONG_TRANSCRIPT_THRESHOLD_CHARS" in gui_src)
+check("brief prompt directs the LLM to stay neutral and per-excerpt",
+      "neutral paragraph" in gui_src and "this excerpt" in gui_src.lower())
+
+
+# ── 17e. pause-processing-semantics ──────────────────────────────────────────
+print("\n[17e] pause-processing-semantics")
+check("muesli_runtime exposes pause/resume helpers",
+      callable(getattr(muesli_runtime, "is_processing_paused", None))
+      and callable(getattr(muesli_runtime, "set_processing_paused", None))
+      and callable(getattr(muesli_runtime, "wait_for_processing_resume", None)))
+
+muesli_runtime.set_processing_paused(False)
+check("set_processing_paused(False) leaves pause unset",
+      muesli_runtime.is_processing_paused() is False)
+muesli_runtime.set_processing_paused(True)
+check("set_processing_paused(True) sets pause",
+      muesli_runtime.is_processing_paused() is True)
+
+sleep_call_count = [0]
+def _fake_sleep(_secs):
+    sleep_call_count[0] += 1
+    if sleep_call_count[0] >= 2:
+        muesli_runtime.set_processing_paused(False)
+waited = muesli_runtime.wait_for_processing_resume(poll_interval=0.0, sleep_fn=_fake_sleep)
+check("wait_for_processing_resume polls while paused and returns once unpaused",
+      waited is True and sleep_call_count[0] >= 1
+      and muesli_runtime.is_processing_paused() is False,
+      detail=f"sleep_calls={sleep_call_count[0]}")
+# Reset so no leakage to other tests / real state.
+muesli_runtime.set_processing_paused(False)
+
+check("muesli.py imports wait_for_processing_resume from runtime module",
+      "from muesli_runtime import wait_for_processing_resume" in muesli_src)
+check("muesli.py transcribe loop calls _wait_for_processing_resume between segments",
+      muesli_src.count("_wait_for_processing_resume()") >= 2,
+      detail=f"count={muesli_src.count('_wait_for_processing_resume()')}")
+check("muesli_gui.py delegates _wait_for_processing_resume to runtime module",
+      "_wait_for_processing_resume_runtime" in gui_src)
+
+check("HTTP route /processing/pause is registered",
+      'segments == ["processing", "pause"]' in service_src)
+check("HTTP route /processing/resume is registered",
+      'segments == ["processing", "resume"]' in service_src)
+check("HTTP route /processing/status is registered",
+      'segments == ["processing", "status"]' in service_src)
+check("muesli_service imports pause helpers from runtime",
+      "from muesli_runtime import is_processing_paused, set_processing_paused" in service_src)
+
+check("MCP exposes pause_processing tool",
+      'name="pause_processing"' in mcp_src)
+check("MCP pause_processing description names the agent aliases",
+      "stop the GPU work" in mcp_src and "silence this machine" in mcp_src)
+check("MCP exposes resume_processing tool",
+      'name="resume_processing"' in mcp_src)
+check("MCP exposes processing_status tool",
+      'name="processing_status"' in mcp_src)
+
+
+# ── 17f. obsidian-export-default ─────────────────────────────────────────────
+print("\n[17f] obsidian-export-default")
+check("config schema includes obsidian_auto_export with True default",
+      'normalized["obsidian_auto_export"] = bool(normalized.get("obsidian_auto_export", True))' in gui_src)
+check("Settings dialog surfaces an auto-export checkbox",
+      "obsidian_auto_export = tk.BooleanVar" in gui_src
+      and "Auto-export every finished recording to Obsidian" in gui_src)
+check("Settings dialog _save persists obsidian_auto_export",
+      'updated["obsidian_auto_export"] = bool(obsidian_auto_export.get())' in gui_src)
+check("_apply_update calls _maybe_auto_export_to_obsidian on done",
+      "self._maybe_auto_export_to_obsidian(meta)" in gui_src)
+check("_maybe_auto_export_to_obsidian is defined and respects the flag",
+      "def _maybe_auto_export_to_obsidian" in gui_src
+      and 'cfg.get("obsidian_auto_export", True)' in gui_src)
+# Functional auto-export — exercise _export_session_to_obsidian directly via a
+# subprocess so we can build the markdown file without importing muesli_gui
+# at module level here (which would trigger the heavy chain).
+import subprocess
+fixture_vault = tempfile.mkdtemp(prefix="muesli-pri1-test-vault-")
+try:
+    helper_script = (
+        "import sys, json, os; "
+        f"sys.path.insert(0, {REPO_DIR!r}); "
+        "import muesli_gui as mg; "
+        f"meta = {{'slug': 'pri1-fixture', 'title': 'Pri1 Fixture',"
+        f" 'started_at': '2026-05-09T10:00:00', 'duration': 11.0,"
+        f" 'status': 'done', 'summary': 'Body summary.',"
+        f" 'transcript': 'Transcript body.', 'speakers': 1}}; "
+        f"cfg = {{'obsidian_vault_dir': {fixture_vault!r},"
+        f" 'obsidian_export_folder': 'Muesli',"
+        f" 'obsidian_auto_export': True}}; "
+        "note_path = mg._export_session_to_obsidian(meta, cfg); "
+        "print(note_path)"
+    )
+    # Run with a generous timeout but accept that this can hang on cold trees;
+    # if so we mark it skipped rather than failing the whole gate.
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", helper_script],
+            capture_output=True, text=True, timeout=180,
+            env=dict(os.environ, MUESLI_HOME=TEST_HOME),
+        )
+    except subprocess.TimeoutExpired:
+        print("  SKIP  _export_session_to_obsidian functional check (import chain stalled — "
+              "known issue, see bugs.md)")
+    else:
+        note_path = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+        check("_export_session_to_obsidian writes a markdown file in the vault",
+              note_path and os.path.exists(note_path),
+              detail=f"stdout={proc.stdout!r} stderr={proc.stderr[-300:]!r}")
+        if note_path and os.path.exists(note_path):
+            content = open(note_path, encoding="utf-8").read()
+            check("exported note contains the title heading and summary section",
+                  "# Pri1 Fixture" in content and "## Summary" in content
+                  and "Body summary." in content,
+                  detail=content[:300])
+finally:
+    shutil.rmtree(fixture_vault, ignore_errors=True)
+
+
+print(f"\n{'='*40}")
+print(f"  {PASS} passed, {FAIL} failed")
+if FAIL:
+    sys.exit(1)

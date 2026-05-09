@@ -7,16 +7,18 @@ from ctypes import wintypes
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import time
 
-from muesli_runtime import load_runtime_state, update_runtime_state
+from muesli_runtime import load_runtime_state, update_runtime_state, RUNTIME_DIR
 
 APP_DIR = os.environ.get("MUESLI_HOME") or os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 PID_FILE = os.path.join(APP_DIR, "muesli_hotkey.pid")
 ICON_FILE = os.path.join(APP_DIR, "assets", "muesli-icon.ico")
+RECORDING_ICON_FILE = os.path.join(RUNTIME_DIR, "muesli-icon-rec.ico")
 DEFAULT_HOTKEY = "Ctrl+Shift+`"
 HOTKEY_ID = 1
 TRAY_UID = 1
@@ -297,6 +299,73 @@ def _tray_event_code(lparam):
         return 0
 
 
+def write_recording_icon(path=RECORDING_ICON_FILE, size=16, force=False):
+    """Generate a simple recording-state .ico (red filled circle on transparent
+    background) using only stdlib so the tray sidecar has a second icon to
+    swap to when recording is active. Returns the path; idempotent.
+
+    Format: ICONDIR + ICONDIRENTRY + BITMAPINFOHEADER + BGRA pixels + AND mask.
+    """
+    if os.path.exists(path) and not force:
+        return path
+    pixels = bytearray(size * size * 4)
+    cx = (size - 1) / 2.0
+    cy = (size - 1) / 2.0
+    radius = (size / 2.0) - 0.5
+    for y in range(size):
+        for x in range(size):
+            dx = x - cx
+            dy = y - cy
+            if dx * dx + dy * dy <= radius * radius:
+                # ICO bitmaps are stored bottom-up: row 0 of the file is the
+                # BOTTOM scanline of the image.
+                idx = ((size - 1 - y) * size + x) * 4
+                pixels[idx]     = 0    # B
+                pixels[idx + 1] = 0    # G
+                pixels[idx + 2] = 220  # R
+                pixels[idx + 3] = 255  # A (fully opaque)
+    # AND mask: 1bpp, 0 = visible. Padded to 32-bit row alignment.
+    row_bytes = ((size + 31) // 32) * 4
+    and_mask = bytes(row_bytes * size)
+    bmp_header_size = 40
+    pix_size = len(pixels)
+    bitmap_size = bmp_header_size + pix_size + len(and_mask)
+    # BITMAPINFOHEADER. height is 2 * actual height because ICO appends the AND
+    # mask under the XOR image.
+    dib = struct.pack(
+        "<IiiHHIIiiII",
+        bmp_header_size,
+        size,
+        size * 2,
+        1,
+        32,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    bitmap = dib + bytes(pixels) + and_mask
+    ico_dir = struct.pack("<HHH", 0, 1, 1)  # reserved, type=1 (icon), count=1
+    entry_offset = 6 + 16
+    entry = struct.pack(
+        "<BBBBHHII",
+        size if size < 256 else 0,
+        size if size < 256 else 0,
+        0,
+        0,
+        1,
+        32,
+        bitmap_size,
+        entry_offset,
+    )
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(ico_dir + entry + bitmap)
+    return path
+
+
 class TraySidecar:
     def __init__(self, mods, vk):
         self._mods = mods
@@ -307,6 +376,9 @@ class TraySidecar:
         self._wndproc = WNDPROC(self._window_proc)
         self._hwnd = None
         self._icon = None
+        self._icon_idle = None
+        self._icon_recording = None
+        self._last_recording_state = None
         self._nid = None
 
     def _menu_label(self, cmd):
@@ -363,13 +435,33 @@ class TraySidecar:
         gdi32.SelectObject(dis.hDC, old_font)
         return True
 
-    def _load_icon(self):
+    def _load_icon(self, path=None):
         flags = LR_LOADFROMFILE | LR_DEFAULTSIZE
+        if path and os.path.exists(path):
+            handle = user32.LoadImageW(None, path, IMAGE_ICON, 0, 0, flags)
+            if handle:
+                return handle
         if os.path.exists(ICON_FILE):
             handle = user32.LoadImageW(None, ICON_FILE, IMAGE_ICON, 0, 0, flags)
             if handle:
                 return handle
         return user32.LoadIconW(None, ctypes.c_wchar_p(IDI_APPLICATION))
+
+    def _ensure_icons(self):
+        if self._icon_idle is None:
+            self._icon_idle = self._load_icon(ICON_FILE)
+        if self._icon_recording is None:
+            try:
+                write_recording_icon(RECORDING_ICON_FILE)
+            except OSError:
+                # If we can't write the recording icon (e.g. RUNTIME_DIR full),
+                # silently fall back to the idle icon — the bug becomes
+                # cosmetic, not a crash.
+                self._icon_recording = self._icon_idle
+            else:
+                self._icon_recording = self._load_icon(RECORDING_ICON_FILE)
+                if not self._icon_recording:
+                    self._icon_recording = self._icon_idle
 
     def _register_window(self):
         wc = WNDCLASSW()
@@ -398,7 +490,9 @@ class TraySidecar:
         self._hwnd = hwnd
 
     def _create_tray_icon(self):
-        self._icon = self._load_icon()
+        self._ensure_icons()
+        self._icon = self._icon_idle
+        self._last_recording_state = False
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         nid.hWnd = self._hwnd
@@ -426,8 +520,14 @@ class TraySidecar:
             state = load_runtime_state()
         if not self._nid:
             return
+        recording = bool(state.get("recording", False))
+        desired_icon = self._icon_recording if recording and self._icon_recording else self._icon_idle
+        icon_changed = desired_icon != self._icon
+        if icon_changed:
+            self._icon = desired_icon
+        self._last_recording_state = recording
         tip = self._tooltip_text()
-        if not force and tip == self._last_tip:
+        if not force and not icon_changed and tip == self._last_tip:
             return
         self._nid.uFlags = NIF_TIP | NIF_ICON | NIF_SHOWTIP
         self._nid.hIcon = self._icon

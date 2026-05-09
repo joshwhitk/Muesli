@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quick smoke test for the muesli module API."""
 
-import atexit, json, shutil, subprocess, sys, os, wave, struct, tempfile, time, types
+import atexit, json, shutil, subprocess, sys, os, wave, struct, tempfile, time, types, urllib.request, urllib.error, socket, threading
 # Unbuffered stdout so progress appears immediately when piped
 sys.stdout.reconfigure(line_buffering=True)
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -11,11 +11,17 @@ os.makedirs(TEST_SHARED_DIR, exist_ok=True)
 with open(os.path.join(TEST_HOME, "config.json"), "w", encoding="utf-8") as _cfg:
     json.dump({"shared_dir": TEST_SHARED_DIR}, _cfg)
 os.environ["MUESLI_HOME"] = TEST_HOME
+# Isolate the runtime state file (pause flag, app_pid, etc.) from the real
+# user state — required by [17e] which round-trips set_processing_paused.
+# Must be set BEFORE the muesli imports below so paths.py picks it up.
+os.environ["MUESLI_RUNTIME_DIR"] = os.path.join(TEST_HOME, "runtime")
+os.makedirs(os.environ["MUESLI_RUNTIME_DIR"], exist_ok=True)
 atexit.register(lambda: shutil.rmtree(TEST_HOME, ignore_errors=True))
 sys.path.insert(0, REPO_DIR)
 
 import muesli as muesli_module
 import muesli_gui as muesli_gui_module
+import muesli_service as muesli_service_module
 from muesli import Muesli
 
 PASS = 0
@@ -826,6 +832,446 @@ check("Detail panel includes the recording-flow diagram surface",
       'def _sync_process_diagram(self, meta):' in gui_source)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
+print("\n[16] local service surface")
+service_source = open(os.path.join(os.path.dirname(__file__), "muesli_service.py"), "r", encoding="utf-8").read()
+check("service exposes health, capabilities, and OpenAPI discovery",
+      'def _openapi_spec(port):' in service_source and
+      '"/health"' in service_source and
+      '"/capabilities"' in service_source and
+      '["openapi.json"]' in service_source)
+check("service exposes deterministic note routes and async job routes",
+      '"/notes/search"' in service_source and
+      '"/jobs/transcribe-file"' in service_source and
+      '"/jobs/ingest-voice-note"' in service_source and
+      '"/jobs/reprocess-note"' in service_source)
+check("API exposes search/latest/overwrite/delete helpers for the service layer",
+      'def get_latest_session(self):' in api_source and
+      'def search_sessions(self, query, component="any", limit=20):' in api_source and
+      'def overwrite_session(self, slug, **updates):' in api_source and
+      'def delete_session(self, slug):' in api_source)
+check("API sidecar writing is centralized so service overwrites stay in sync",
+      'def _write_note_sidecar(shared_dir, slug, title, summary, corrections, bugs, transcript):' in api_source and
+      '_write_note_sidecar(' in api_source)
+
+
+class FakeServiceApp:
+    def __init__(self):
+        self._recording = False
+        self._rec_slug = None
+        self._rec_started = None
+        self.notes = [{
+            "slug": "alpha-note",
+            "title": "Alpha Note",
+            "summary": "Short summary",
+            "transcript": "Alpha transcript about deadlines and owners.",
+            "started_at": "2026-04-27T09:00:00",
+            "duration": 12.5,
+            "speakers": 2,
+            "status": "done",
+            "audio_path": os.path.join(TEST_SHARED_DIR, "alpha-note.wav"),
+        }]
+        make_silent_wav(self.notes[0]["audio_path"], duration_s=1)
+
+    def list_sessions(self):
+        return [dict(note) for note in self.notes]
+
+    def get_latest_session(self):
+        return dict(self.notes[0]) if self.notes else None
+
+    def get_session(self, slug):
+        for note in self.notes:
+            if note["slug"] == slug:
+                return dict(note)
+        return None
+
+    def delete_session(self, slug):
+        for idx, note in enumerate(self.notes):
+            if note["slug"] == slug:
+                self.notes.pop(idx)
+                return True
+        return False
+
+    def search_sessions(self, query, component="any", limit=20):
+        query = str(query or "").lower()
+        hits = []
+        for note in self.notes:
+            haystack = " ".join(str(note.get(field, "")) for field in ("title", "summary", "transcript", "started_at", "status")).lower()
+            if query in haystack:
+                match = dict(note)
+                match["match_component"] = component
+                match["match_excerpt"] = note["transcript"][:60]
+                hits.append(match)
+        return hits[:limit]
+
+    def overwrite_session(self, slug, **updates):
+        for note in self.notes:
+            if note["slug"] == slug:
+                note.update(updates)
+                return dict(note)
+        raise FileNotFoundError(slug)
+
+    def transcribe(self, path):
+        return f"transcript for {os.path.basename(path)}"
+
+    def process_file(self, path):
+        return {
+            "slug": "imported-note",
+            "title": "Imported Note",
+            "summary": "Imported summary",
+            "transcript": f"processed {os.path.basename(path)}",
+            "started_at": "2026-04-27T10:00:00",
+            "duration": 3.0,
+            "speakers": 1,
+            "status": "done",
+            "audio_path": path,
+        }
+
+    def resummarize_session(self, session_or_slug, prompt_text=None, mode_id=None, mode_title=None):
+        slug = session_or_slug["slug"] if isinstance(session_or_slug, dict) else str(session_or_slug)
+        return {
+            "slug": slug,
+            "title": "Reprocessed Note",
+            "summary": "Reprocessed summary",
+            "transcript": "Fresh transcript",
+            "started_at": "2026-04-27T11:00:00",
+            "duration": 4.0,
+            "speakers": 1,
+            "status": "done",
+            "audio_path": os.path.join(TEST_SHARED_DIR, slug + ".wav"),
+            "summary_mode": mode_id or "general",
+            "summary_mode_title": mode_title or "General",
+        }
+
+    def start_recording(self):
+        self._recording = True
+        self._rec_slug = "live-note"
+        self._rec_started = types.SimpleNamespace(isoformat=lambda: "2026-04-27T12:00:00")
+
+    def stop_recording(self):
+        self._recording = False
+        return {
+            "slug": "live-note",
+            "title": "Live Note",
+            "summary": "Stopped cleanly",
+            "transcript": "Captured transcript",
+            "started_at": "2026-04-27T12:00:00",
+            "duration": 5.0,
+            "speakers": 1,
+            "status": "done",
+            "audio_path": os.path.join(TEST_SHARED_DIR, "live-note.wav"),
+        }
+
+
+def _http_json(url, method="GET", payload=None):
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as res:
+        return res.status, json.loads(res.read().decode("utf-8"))
+
+
+fake_service_app = FakeServiceApp()
+service = muesli_service_module.MuesliHttpService(app=fake_service_app)
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+service_port = sock.getsockname()[1]
+sock.close()
+http_server = muesli_service_module.serve(port=service_port, host="127.0.0.1", service=service)
+http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+http_thread.start()
+try:
+    status_code, health = _http_json(f"http://127.0.0.1:{service_port}/health")
+    check("service health endpoint responds", status_code == 200 and health.get("ok") is True, detail=str(health))
+    status_code, capabilities = _http_json(f"http://127.0.0.1:{service_port}/capabilities")
+    check("service capabilities include components and jobs",
+          status_code == 200 and "components" in capabilities and "supports_jobs" in capabilities,
+          detail=str(capabilities))
+    status_code, openapi = _http_json(f"http://127.0.0.1:{service_port}/openapi.json")
+    check("service publishes OpenAPI for registry auto-discovery",
+          status_code == 200 and "/jobs/transcribe-file" in openapi.get("paths", {}),
+          detail=str(openapi.get("paths", {}).keys()))
+    status_code, notes_payload = _http_json(f"http://127.0.0.1:{service_port}/notes")
+    check("service lists notes over HTTP",
+          status_code == 200 and len(notes_payload.get("notes", [])) == 1,
+          detail=str(notes_payload))
+    status_code, note_payload = _http_json(f"http://127.0.0.1:{service_port}/notes/alpha-note")
+    check("service retrieves a single note over HTTP",
+          status_code == 200 and note_payload.get("slug") == "alpha-note",
+          detail=str(note_payload))
+    status_code, component_payload = _http_json(f"http://127.0.0.1:{service_port}/notes/alpha-note/components/transcript")
+    check("service exposes component retrieval with length metadata",
+          status_code == 200 and component_payload.get("component") == "transcript" and component_payload.get("length", 0) > 0,
+          detail=str(component_payload))
+    status_code, overwrite_payload = _http_json(
+        f"http://127.0.0.1:{service_port}/notes/alpha-note/components/summary",
+        method="PUT",
+        payload={"value": "Edited summary"},
+    )
+    check("service overwrites note components over HTTP",
+          status_code == 200 and overwrite_payload.get("summary") == "Edited summary",
+          detail=str(overwrite_payload))
+    status_code, search_payload = _http_json(
+        f"http://127.0.0.1:{service_port}/notes/search",
+        method="POST",
+        payload={"query": "deadlines", "component": "any", "limit": 5},
+    )
+    check("service deterministic search returns note matches",
+          status_code == 200 and len(search_payload.get("results", [])) == 1,
+          detail=str(search_payload))
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as service_audio:
+        service_audio_path = service_audio.name
+    try:
+        make_silent_wav(service_audio_path, duration_s=1)
+        status_code, job_payload = _http_json(
+            f"http://127.0.0.1:{service_port}/jobs/transcribe-file",
+            method="POST",
+            payload={"path": service_audio_path},
+        )
+        job_id = job_payload.get("id")
+        polled = {}
+        for _ in range(30):
+            time.sleep(0.05)
+            _status, polled = _http_json(f"http://127.0.0.1:{service_port}/jobs/{job_id}")
+            if polled.get("status") in ("done", "error"):
+                break
+        check("service async job completes and returns transcript text",
+              polled.get("status") == "done" and "transcript" in polled.get("result", {}),
+              detail=str(polled))
+    finally:
+        os.unlink(service_audio_path)
+finally:
+    http_server.shutdown()
+    http_server.server_close()
+
+# ── 17. Pri1 regression suite ────────────────────────────────────────────────
+print("\n[17] Pri1 regression suite")
+
+# 17a. recording-cta-status-consistency: a single helper updates the button
+#      label, recording flag, and status_var atomically. We assert the helper
+#      exists and references all three of those identifiers, so future drift
+#      where _start_recording / _stop_recording set them piecemeal can't
+#      reintroduce the CTA-vs-status desync.
+gui_source = open(os.path.join(REPO_DIR, "muesli_gui.py"), encoding="utf-8").read()
+check("CTA helper _apply_recording_state is defined",
+      "def _apply_recording_state" in gui_source)
+helper_block_start = gui_source.find("def _apply_recording_state")
+helper_block = gui_source[helper_block_start:helper_block_start + 2000]
+check("CTA helper updates _recording, _rec_btn, and _status_var atomically",
+      "self._recording" in helper_block and "self._rec_btn.configure_button" in helper_block
+      and "self._status_var.set" in helper_block,
+      detail=helper_block[:200])
+check("_start_recording resets state when recorder.start raises",
+      "self._apply_recording_state(False, status_text=" in gui_source
+      and "Could not start recording" in gui_source)
+check("_stop_recording delegates to _apply_recording_state",
+      "self._apply_recording_state(False, status_text=\"Finishing processing" in gui_source)
+
+# 17b. transcript-visible-after-stop: the restore call after _detail.show(meta)
+#      must NOT be guarded by `if self._live_transcript:`. We assert the gate
+#      is gone and the preserved-transcript fallback exists.
+check("preserved-transcript fallback exists in _stop_recording",
+      "preserved_transcript = self._live_transcript" in gui_source
+      and "self._compose_realtime_transcript()" in gui_source)
+check("the old `if self._live_transcript:` gate is gone",
+      "if self._live_transcript:\n            self._detail.set_live_transcript" not in gui_source)
+
+# 17c. tray-desktop-live-icons: ICO encoder produces a valid Windows .ico file
+#      that contains exactly one 32bpp 16x16 image with the documented header
+#      structure. We exercise the encoder directly so the test runs without
+#      having a tray window up.
+import tempfile as _tempfile
+sys.path.insert(0, REPO_DIR)
+import muesli_hotkey as muesli_hotkey_module
+ico_dir = _tempfile.mkdtemp(prefix="muesli-test-ico-")
+ico_path = os.path.join(ico_dir, "rec.ico")
+muesli_hotkey_module.write_recording_icon(ico_path, size=16, force=True)
+ico_bytes = open(ico_path, "rb").read()
+check("recording-icon ICO file is created", os.path.exists(ico_path))
+check("ICONDIR header is well-formed (reserved=0, type=1, count=1)",
+      ico_bytes[:6] == struct.pack("<HHH", 0, 1, 1))
+ico_w, ico_h, _, _, planes, bits, byte_size, offset = struct.unpack(
+    "<BBBBHHII", ico_bytes[6:22])
+check("ICONDIRENTRY reports 16x16, 32bpp, 1 plane",
+      ico_w == 16 and ico_h == 16 and planes == 1 and bits == 32,
+      detail=f"w={ico_w} h={ico_h} planes={planes} bits={bits}")
+check("ICONDIRENTRY image offset and size point inside the file",
+      offset + byte_size == len(ico_bytes))
+# BITMAPINFOHEADER inside the bitmap region. Height is 2x actual height per ICO spec.
+dib_height = struct.unpack("<i", ico_bytes[offset + 8:offset + 12])[0]
+check("BITMAPINFOHEADER height is 2x image height (XOR + AND mask convention)",
+      dib_height == 32, detail=f"dib_height={dib_height}")
+check("write_recording_icon is idempotent when called again without force",
+      muesli_hotkey_module.write_recording_icon(ico_path, size=16) == ico_path
+      and open(ico_path, "rb").read() == ico_bytes)
+import shutil as _shutil
+_shutil.rmtree(ico_dir, ignore_errors=True)
+
+# 17d. long-transcript-summary-quality: long transcripts are split into
+#      windows, each window is summarised individually, and the per-window
+#      briefs are fed back into the real summary prompt — instead of the raw
+#      transcript, where the LLM would over-weight the tail.
+import muesli_gui as muesli_gui_for_long
+long_transcript = "Sentence about the main HDX kickoff topic. " * 200  # ~8000 chars
+windows = muesli_gui_for_long._split_transcript_for_map_reduce(long_transcript)
+check("long transcripts split into multiple windows for map-reduce",
+      len(windows) >= 2, detail=f"window_count={len(windows)}")
+short_transcript = "Quick standup notes."
+check("short transcripts stay as a single window (no map-reduce overhead)",
+      muesli_gui_for_long._split_transcript_for_map_reduce(short_transcript) == [short_transcript])
+
+# Stub _llm_generate so we can verify the call pattern without invoking a real LLM.
+generate_calls = []
+real_llm = muesli_gui_for_long._llm_generate
+def _fake_llm_generate(prompt_text, ollama_timeout=None):
+    generate_calls.append(prompt_text)
+    if "neutral paragraph" in prompt_text:
+        return "This excerpt covers the main HDX kickoff discussion."
+    return FAKE_LLM_JSON
+muesli_gui_for_long._llm_generate = _fake_llm_generate
+try:
+    ai = muesli_gui_for_long._generate_ai_fields(long_transcript)
+finally:
+    muesli_gui_for_long._llm_generate = real_llm
+check("map-reduce path issues per-window brief calls + a final summary call",
+      len(generate_calls) >= len(windows) + 1,
+      detail=f"calls={len(generate_calls)} windows={len(windows)}")
+check("the final summary prompt sees the condensed briefs, not the raw tail",
+      "Excerpt 1 brief" in generate_calls[-1],
+      detail=f"last_call_head={generate_calls[-1][:200]}")
+check("map-reduce result is still parsed into the standard ai dict shape",
+      isinstance(ai, dict) and "title" in ai and "summary" in ai)
+
+# 17e. pause-processing-semantics: pause/resume helpers live on muesli_runtime
+#      (so muesli.py can import them without a GUI dep), HTTP routes exist,
+#      MCP tools include the documented natural-language aliases, and the
+#      transcribe loop calls wait_for_processing_resume.
+import muesli_runtime as muesli_runtime_for_pause
+check("muesli_runtime exposes pause/resume helpers",
+      callable(getattr(muesli_runtime_for_pause, "is_processing_paused", None))
+      and callable(getattr(muesli_runtime_for_pause, "set_processing_paused", None))
+      and callable(getattr(muesli_runtime_for_pause, "wait_for_processing_resume", None)))
+
+# Round-trip the pause flag through set/get on a temp runtime state.
+# (MUESLI_HOME is already set to TEST_HOME for this test run, so writes are isolated.)
+muesli_runtime_for_pause.set_processing_paused(False)
+check("set_processing_paused(False) leaves pause unset",
+      muesli_runtime_for_pause.is_processing_paused() is False)
+muesli_runtime_for_pause.set_processing_paused(True)
+check("set_processing_paused(True) sets pause",
+      muesli_runtime_for_pause.is_processing_paused() is True)
+# wait_for_processing_resume must spin while paused. Inject a fake sleep that
+# clears the flag on the second iteration so the loop terminates and we can
+# assert it actually polled.
+sleep_call_count = [0]
+def _fake_sleep(_secs):
+    sleep_call_count[0] += 1
+    if sleep_call_count[0] >= 2:
+        muesli_runtime_for_pause.set_processing_paused(False)
+waited = muesli_runtime_for_pause.wait_for_processing_resume(poll_interval=0.0, sleep_fn=_fake_sleep)
+check("wait_for_processing_resume polls while paused and returns once unpaused",
+      waited is True and sleep_call_count[0] >= 1
+      and muesli_runtime_for_pause.is_processing_paused() is False,
+      detail=f"sleep_calls={sleep_call_count[0]}")
+
+# muesli.py respects pause inside its transcribe loop.
+muesli_source = open(os.path.join(REPO_DIR, "muesli.py"), encoding="utf-8").read()
+check("muesli.py imports wait_for_processing_resume from runtime module",
+      "from muesli_runtime import wait_for_processing_resume" in muesli_source)
+check("muesli.py transcribe loop calls _wait_for_processing_resume between segments",
+      muesli_source.count("_wait_for_processing_resume()") >= 2,
+      detail=f"count={muesli_source.count('_wait_for_processing_resume()')}")
+
+# HTTP service routes are wired.
+service_source = open(os.path.join(REPO_DIR, "muesli_service.py"), encoding="utf-8").read()
+check("HTTP route /processing/pause is registered",
+      'segments == ["processing", "pause"]' in service_source)
+check("HTTP route /processing/resume is registered",
+      'segments == ["processing", "resume"]' in service_source)
+check("HTTP route /processing/status is registered",
+      'segments == ["processing", "status"]' in service_source)
+
+# MCP tools list includes pause/resume/status with the documented NLP aliases.
+mcp_source = open(os.path.join(REPO_DIR, "muesli_mcp.py"), encoding="utf-8").read()
+check("MCP exposes pause_processing tool",
+      'name="pause_processing"' in mcp_source)
+check("MCP pause_processing description names the agent aliases",
+      "stop the GPU work" in mcp_source and "silence this machine" in mcp_source)
+check("MCP exposes resume_processing tool",
+      'name="resume_processing"' in mcp_source)
+check("MCP exposes processing_status tool",
+      'name="processing_status"' in mcp_source)
+
+# 17f. obsidian-export-default: config defaults to True, settings dialog
+#      surfaces the toggle, and finished recordings auto-export.
+norm = muesli_gui_for_long._normalize_config({})
+check("obsidian_auto_export defaults to True in fresh config",
+      norm.get("obsidian_auto_export") is True)
+norm_off = muesli_gui_for_long._normalize_config({"obsidian_auto_export": False})
+check("obsidian_auto_export can be turned off",
+      norm_off.get("obsidian_auto_export") is False)
+check("Settings dialog surfaces an auto-export checkbox",
+      "obsidian_auto_export = tk.BooleanVar" in gui_source
+      and "Auto-export every finished recording to Obsidian" in gui_source)
+check("Settings dialog _save persists obsidian_auto_export",
+      'updated["obsidian_auto_export"] = bool(obsidian_auto_export.get())' in gui_source)
+check("_apply_update calls _maybe_auto_export_to_obsidian on done",
+      "self._maybe_auto_export_to_obsidian(meta)" in gui_source)
+
+# Functional: _maybe_auto_export_to_obsidian writes a markdown file when the
+# vault is configured and the auto-export flag is True. We exercise it by
+# constructing a minimal stand-in instead of mounting a Tk root.
+class _ObsidianHostStub:
+    def __init__(self, status_holder):
+        self._status_var = status_holder
+    _maybe_auto_export_to_obsidian = muesli_gui_for_long.MuesliApp._maybe_auto_export_to_obsidian
+
+class _Holder:
+    def __init__(self): self.last = ""
+    def set(self, v): self.last = v
+
+obsidian_vault = _tempfile.mkdtemp(prefix="muesli-test-vault-")
+prev_cfg = muesli_gui_for_long.load_config()
+try:
+    cfg = dict(prev_cfg)
+    cfg["obsidian_vault_dir"] = obsidian_vault
+    cfg["obsidian_export_folder"] = "Muesli"
+    cfg["obsidian_auto_export"] = True
+    muesli_gui_for_long.save_config(cfg)
+    holder = _Holder()
+    host = _ObsidianHostStub(holder)
+    fake_meta = {
+        "slug": "auto-export-fixture",
+        "title": "Auto Export Fixture",
+        "started_at": "2026-05-09T10:00:00",
+        "duration": 12.5,
+        "status": "done",
+        "summary": "Body summary.",
+        "transcript": "Transcript body.",
+        "speakers": 1,
+    }
+    _ObsidianHostStub._maybe_auto_export_to_obsidian(host, fake_meta)
+    expected_note = os.path.join(obsidian_vault, "Muesli", "auto-export-fixture.md")
+    check("auto-export writes the markdown note to the configured vault",
+          os.path.exists(expected_note),
+          detail=f"path={expected_note} status={holder.last!r}")
+    check("status_var reports the auto-export result",
+          "Auto-exported to Obsidian" in holder.last,
+          detail=f"status={holder.last!r}")
+    # When auto-export is OFF the note should not be created on the next call.
+    cfg["obsidian_auto_export"] = False
+    muesli_gui_for_long.save_config(cfg)
+    fake_meta2 = dict(fake_meta, slug="auto-export-disabled")
+    holder2 = _Holder()
+    host2 = _ObsidianHostStub(holder2)
+    _ObsidianHostStub._maybe_auto_export_to_obsidian(host2, fake_meta2)
+    not_expected = os.path.join(obsidian_vault, "Muesli", "auto-export-disabled.md")
+    check("auto-export is skipped when the toggle is off",
+          not os.path.exists(not_expected) and holder2.last == "",
+          detail=f"path_exists={os.path.exists(not_expected)} status={holder2.last!r}")
+finally:
+    muesli_gui_for_long.save_config(prev_cfg)
+    _shutil.rmtree(obsidian_vault, ignore_errors=True)
+
 print(f"\n{'='*40}")
 print(f"  {PASS} passed, {FAIL} failed")
 if FAIL:

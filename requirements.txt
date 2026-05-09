@@ -5,3 +5,4 @@ huggingface-hub
 anthropic
 sounddevice
 websocket-client
+mcp
