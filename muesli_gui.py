@@ -123,6 +123,12 @@ CHANNELS = 1
 CHUNK    = 1024
 FORMAT   = pyaudio.paInt16 if pyaudio else None
 LIVE_CHUNK_SECONDS = 10
+# Recordings shorter than this are auto-discarded as accidental taps — no
+# transcription, no summary, audio + metadata removed. The threshold is short
+# enough that intentional tiny voice memos still survive: 5s lets through a
+# normal "remind me to call Sarah" note, while filtering out the sub-second
+# hotkey-bounce or accidental Stop-immediately-after-Start case.
+SHORT_RECORDING_DISCARD_SECONDS = 5
 OPENAI_TRANSCRIPTION_DEFAULT_MODEL = "gpt-4o-transcribe"
 OPENAI_TRANSCRIPTION_MODELS = (
     OPENAI_TRANSCRIPTION_DEFAULT_MODEL,
@@ -4688,6 +4694,17 @@ class MuesliApp(tk.Tk):
         self.update_idletasks()
 
         meta = self._recorder.stop()
+        # Auto-discard accidental short taps. Skip the discard when the user
+        # gave the recording a manual title or summary mid-session — that's
+        # an explicit signal they consider it real, however brief.
+        has_manual_intent = (
+            (self._live_manual_title_active and self._live_manual_title.strip())
+            or self._live_manual_summary_active
+        )
+        if (float(meta.get("duration") or 0) < SHORT_RECORDING_DISCARD_SECONDS
+                and not has_manual_intent):
+            self._discard_short_recording(meta)
+            return
         if self._live_manual_title_active and self._live_manual_title.strip():
             meta["title"] = self._live_manual_title.strip()
             meta["title_manual"] = True
@@ -4748,6 +4765,47 @@ class MuesliApp(tk.Tk):
                               transcript=(transcript or None), summaries=summaries)
 
         threading.Thread(target=_finalize, daemon=True).start()
+
+    def _discard_short_recording(self, meta):
+        """Drop a sub-threshold recording with no transcription/summary work.
+        Tears down any in-flight pipeline + realtime transcriber, removes
+        the saved WAV and metadata JSON, resets live state so the next
+        recording starts clean. Surfaces a brief status note so the user
+        sees that the tap was discarded (not silently swallowed)."""
+        # Tear down workers so callbacks don't fire after we move on.
+        if self._realtime_transcriber is not None:
+            try:
+                self._realtime_transcriber.finish()
+            except Exception:
+                pass
+        if self._chunk_pipeline is not None:
+            try:
+                self._chunk_pipeline.finish()
+            except Exception:
+                pass
+        self._chunk_pipeline = None
+        self._realtime_transcriber = None
+        # delete_recording handles WAV (in REC_DIR + SHARED_DIR) and the JSON
+        # _save_meta wrote inside Recorder.stop().
+        delete_recording(meta)
+        duration = float(meta.get("duration") or 0)
+        self._status_var.set(
+            f"Discarded short recording ({duration:.1f}s, under {SHORT_RECORDING_DISCARD_SECONDS}s threshold)."
+        )
+        # Reset live UI state so the next recording starts on a clean slate.
+        self._live_transcript = ""
+        self._live_chunks_transcribed = 0
+        self._live_preview = None
+        self._live_manual_title = ""
+        self._live_manual_title_active = False
+        self._live_manual_summary = ""
+        self._live_manual_summary_active = False
+        self._provisional_summary_started = False
+        self._provisional_transcript_seed = ""
+        self._cur_meta = None
+        # Don't insert into the listbox or call _detail.show — the recording
+        # never existed as far as the user-facing session list is concerned.
+        self._publish_runtime_state()
 
     def _on_proc_update(self, meta, stage):
         self.after(0, lambda: self._apply_update(meta, stage))

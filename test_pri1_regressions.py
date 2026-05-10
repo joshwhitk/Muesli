@@ -196,6 +196,60 @@ check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_src)
 
 
+# ── 17g. discard-short-recordings ────────────────────────────────────────────
+print("\n[17g] discard-short-recordings")
+check("SHORT_RECORDING_DISCARD_SECONDS constant defined with value 5",
+      "SHORT_RECORDING_DISCARD_SECONDS = 5" in gui_src)
+check("_discard_short_recording method defined",
+      "def _discard_short_recording" in gui_src)
+check("_stop_recording branches on duration < threshold",
+      'meta.get("duration") or 0) < SHORT_RECORDING_DISCARD_SECONDS' in gui_src)
+check("manual title/summary bypasses the discard (has_manual_intent)",
+      "has_manual_intent = (" in gui_src
+      and "and not has_manual_intent" in gui_src)
+check("discard helper calls delete_recording on the meta",
+      "delete_recording(meta)" in gui_src[gui_src.find("def _discard_short_recording"):])
+check("discard helper resets _chunk_pipeline + _realtime_transcriber to None",
+      "self._chunk_pipeline = None" in gui_src[gui_src.find("def _discard_short_recording"):]
+      and "self._realtime_transcriber = None" in gui_src[gui_src.find("def _discard_short_recording"):])
+# Functional: delete_recording cleans WAV + JSON from REC_DIR. We use the
+# import-light helpers from muesli_gui only via a subprocess to avoid pulling
+# the heavy chain into THIS test. (The full smoke covers it via [17].)
+import subprocess as _sp
+fixture = tempfile.mkdtemp(prefix="muesli-discard-fixture-")
+try:
+    helper = (
+        f"import sys, os, json, wave, struct;"
+        f"sys.path.insert(0, {REPO_DIR!r});"
+        f"os.environ['MUESLI_HOME'] = {fixture!r};"
+        "import muesli_gui as mg;"
+        "rec_dir = mg.REC_DIR;"
+        "os.makedirs(rec_dir, exist_ok=True);"
+        "slug = 'discard-fixture';"
+        "wav = os.path.join(rec_dir, slug + '.wav');"
+        "wf = wave.open(wav, 'wb'); wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000);"
+        "wf.writeframes(struct.pack('<32000h', *([0]*32000))); wf.close();"
+        "meta = {'slug': slug, 'duration': 2.0};"
+        "json.dump(meta, open(os.path.join(rec_dir, slug + '.json'), 'w'));"
+        "wav_before = os.path.exists(wav);"
+        "json_before = os.path.exists(os.path.join(rec_dir, slug + '.json'));"
+        "mg.delete_recording(meta);"
+        "wav_after = os.path.exists(wav);"
+        "json_after = os.path.exists(os.path.join(rec_dir, slug + '.json'));"
+        "print(f'before wav={wav_before} json={json_before} | after wav={wav_after} json={json_after}')"
+    )
+    try:
+        proc = _sp.run([sys.executable, "-c", helper], capture_output=True, text=True, timeout=180)
+        out_line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+        check("delete_recording removes the local WAV and metadata JSON",
+              "before wav=True json=True | after wav=False json=False" in out_line,
+              detail=f"stdout={out_line!r} stderr={proc.stderr[-300:]!r}")
+    except _sp.TimeoutExpired:
+        print("  SKIP  delete_recording functional check (import chain stalled — see bugs.md)")
+finally:
+    shutil.rmtree(fixture, ignore_errors=True)
+
+
 # ── 17f. obsidian-export-default ─────────────────────────────────────────────
 print("\n[17f] obsidian-export-default")
 check("config schema includes obsidian_auto_export with True default",

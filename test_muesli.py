@@ -1206,6 +1206,45 @@ check("MCP exposes resume_processing tool",
 check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_source)
 
+# 17g. discard-short-recordings: recordings under SHORT_RECORDING_DISCARD_SECONDS
+#      get auto-deleted with no transcription/summary work, unless the user
+#      gave them a manual title or summary mid-recording.
+check("SHORT_RECORDING_DISCARD_SECONDS = 5 in muesli_gui",
+      "SHORT_RECORDING_DISCARD_SECONDS = 5" in gui_source)
+check("_discard_short_recording method defined",
+      "def _discard_short_recording" in gui_source)
+check("_stop_recording branches on duration < SHORT_RECORDING_DISCARD_SECONDS",
+      'meta.get("duration") or 0) < SHORT_RECORDING_DISCARD_SECONDS' in gui_source)
+check("manual title/summary bypasses the discard via has_manual_intent gate",
+      "has_manual_intent = (" in gui_source and "and not has_manual_intent" in gui_source)
+discard_block = gui_source[gui_source.find("def _discard_short_recording"):]
+check("discard helper calls delete_recording on the meta",
+      "delete_recording(meta)" in discard_block)
+check("discard helper tears down chunk pipeline + realtime transcriber",
+      "self._chunk_pipeline = None" in discard_block
+      and "self._realtime_transcriber = None" in discard_block)
+# Functional: delete_recording (the cleanup primitive used by the discard
+# path) actually removes the WAV + metadata JSON written by Recorder.stop.
+discard_fixture_dir = _tempfile.mkdtemp(prefix="muesli-test-discard-")
+try:
+    rec_dir = muesli_gui_for_long.REC_DIR
+    os.makedirs(rec_dir, exist_ok=True)
+    fixture_slug = "discard-short-fixture"
+    fixture_wav = os.path.join(rec_dir, fixture_slug + ".wav")
+    make_silent_wav(fixture_wav, duration_s=2)  # 2s, under the 5s threshold
+    fixture_json = os.path.join(rec_dir, fixture_slug + ".json")
+    with open(fixture_json, "w", encoding="utf-8") as _f:
+        json.dump({"slug": fixture_slug, "duration": 2.0, "status": "processing"}, _f)
+    check("fixture WAV + JSON exist before discard",
+          os.path.exists(fixture_wav) and os.path.exists(fixture_json))
+    muesli_gui_for_long.delete_recording({"slug": fixture_slug, "duration": 2.0})
+    check("delete_recording removes the WAV from REC_DIR",
+          not os.path.exists(fixture_wav))
+    check("delete_recording removes the metadata JSON from REC_DIR",
+          not os.path.exists(fixture_json))
+finally:
+    _shutil.rmtree(discard_fixture_dir, ignore_errors=True)
+
 # 17f. obsidian-export-default: config defaults to True, settings dialog
 #      surfaces the toggle, and finished recordings auto-export.
 norm = muesli_gui_for_long._normalize_config({})
