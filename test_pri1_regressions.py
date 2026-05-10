@@ -196,6 +196,53 @@ check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_src)
 
 
+# ── 17h. recording-state-icon-all-surfaces ───────────────────────────────────
+print("\n[17h] recording-state-icon-all-surfaces")
+check("_make_recording_variant_icon helper defined in muesli_gui",
+      "def _make_recording_variant_icon" in gui_src)
+check("MuesliApp.__init__ builds _icon_rec via the variant helper",
+      "_make_recording_variant_icon(self, self._icon_idle)" in gui_src)
+check("blink timer state vars (_blink_id, _blink_state) initialised",
+      "self._blink_id = None" in gui_src and "self._blink_state = False" in gui_src)
+check("_start_blink_timer / _tick_blink / _stop_blink_timer all defined",
+      "def _start_blink_timer" in gui_src
+      and "def _tick_blink" in gui_src
+      and "def _stop_blink_timer" in gui_src)
+check("_apply_recording_state(True) starts the blink timer",
+      "self._start_blink_timer()" in gui_src)
+check("_apply_recording_state(False) stops the blink timer",
+      "self._stop_blink_timer()" in gui_src)
+check("blink cadence is 600ms",
+      "self.after(600, self._tick_blink)" in gui_src)
+hotkey_src = read("muesli_hotkey.py")
+check("tray _refresh_tray alternates icons via _blink_phase when recording",
+      "self._blink_phase = not getattr(self, \"_blink_phase\", False)" in hotkey_src
+      and "if recording and self._icon_recording:" in hotkey_src)
+check("tray pins to idle icon when not recording",
+      "self._blink_phase = False" in hotkey_src
+      and "desired_icon = self._icon_idle" in hotkey_src)
+
+
+# ── 17i. process-graph-responsive-layout ─────────────────────────────────────
+print("\n[17i] process-graph-responsive-layout")
+check("_draw_process_diagram uses actual canvas width with low floor (200, not 420)",
+      "max(canvas.winfo_width(), 200)" in gui_src
+      and "max(canvas.winfo_width(), 420)" not in gui_src)
+check("side margin scales with width (14..34) instead of fixed 34",
+      "margin_x = max(14, min(34, int(width * 0.08)))" in gui_src)
+# Sanity: the formula gives expected values at narrow / wide.
+def _expected_margin(width):
+    return max(14, min(34, int(width * 0.08)))
+check("at 200px the margin clamps to 16px", _expected_margin(200) == 16,
+      detail=f"got {_expected_margin(200)}")
+check("at 420px the margin clamps to 33px (just under the 34 ceiling)",
+      _expected_margin(420) == 33, detail=f"got {_expected_margin(420)}")
+check("at 800px the margin caps at 34px", _expected_margin(800) == 34,
+      detail=f"got {_expected_margin(800)}")
+check("at 100px the margin floors at 14px", _expected_margin(100) == 14,
+      detail=f"got {_expected_margin(100)}")
+
+
 # ── 17g. discard-short-recordings ────────────────────────────────────────────
 print("\n[17g] discard-short-recordings")
 check("SHORT_RECORDING_DISCARD_SECONDS constant defined with value 5",

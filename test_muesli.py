@@ -1206,6 +1206,31 @@ check("MCP exposes resume_processing tool",
 check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_source)
 
+# 17h. recording-state-icon-all-surfaces: blink driven by _apply_recording_state
+#      across taskbar (Tk wm_iconphoto) and tray (muesli_hotkey.py).
+check("_make_recording_variant_icon helper defined",
+      "def _make_recording_variant_icon" in gui_source)
+check("MuesliApp.__init__ builds _icon_rec via the variant helper",
+      "_make_recording_variant_icon(self, self._icon_idle)" in gui_source)
+check("_apply_recording_state(True) starts blink, (False) stops",
+      "self._start_blink_timer()" in gui_source
+      and "self._stop_blink_timer()" in gui_source)
+check("blink cadence 600ms",
+      "self.after(600, self._tick_blink)" in gui_source)
+hotkey_source = open(os.path.join(REPO_DIR, "muesli_hotkey.py"), encoding="utf-8").read()
+check("tray _refresh_tray alternates icons via _blink_phase",
+      "self._blink_phase = not getattr(self, \"_blink_phase\", False)" in hotkey_source
+      and "if recording and self._icon_recording:" in hotkey_source)
+
+
+# 17i. process-graph-responsive-layout: actual canvas width + scaling margin.
+check("_draw_process_diagram drops the 420 floor (uses actual width with low floor 200)",
+      "max(canvas.winfo_width(), 200)" in gui_source
+      and "max(canvas.winfo_width(), 420)" not in gui_source)
+check("side margin scales with width (14..34)",
+      "margin_x = max(14, min(34, int(width * 0.08)))" in gui_source)
+
+
 # 17g. discard-short-recordings: recordings under SHORT_RECORDING_DISCARD_SECONDS
 #      get auto-deleted with no transcription/summary work, unless the user
 #      gave them a manual title or summary mid-recording.

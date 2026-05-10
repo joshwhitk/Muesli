@@ -2909,6 +2909,51 @@ def _load_app_icon(master):
     return _make_mic_icon(master, GREEN)
 
 
+def _make_recording_variant_icon(master, base_icon):
+    """Build a recording-state PhotoImage = base + red dot in bottom-right.
+    Used by the blink animation in _apply_recording_state to give the taskbar
+    icon a visually distinct 'recording' frame (the existing taskbar swap was
+    a no-op visually because _icon_rec was aliased to _icon_idle).
+
+    Future surface decision (desktop-live-icon-feasibility, researched
+    2026-05-11): Windows Desktop .lnk icons CAN be swapped at runtime via
+    IShellLink::SetIconLocation + IPersistFile::Save + SHChangeNotify(
+    SHCNE_UPDATEITEM). Latency is sub-second IF you point at two distinct
+    .ico files (don't rewrite the bytes of one — the iconcache trap). But
+    the idiomatic Windows surface for app-state signalling is the taskbar
+    overlay icon (ITaskbarList3::SetOverlayIcon) — that's what OBS, Discord,
+    Zoom use for 'recording / live / muted'. Desktop-shortcut swapping is
+    novel enough that users won't notice it. Recommendation: skip the
+    Desktop path; if we want a third surface beyond tray + taskbar-icon
+    blink, do taskbar overlay icon instead."""
+    try:
+        w = base_icon.width()
+        h = base_icon.height()
+    except Exception:
+        return base_icon
+    if w <= 0 or h <= 0:
+        return base_icon
+    try:
+        variant = tk.PhotoImage(master=master, width=w, height=h)
+        variant.tk.call(variant, "copy", base_icon)
+    except Exception:
+        return base_icon
+    # Stamp a filled red square in the bottom-right quadrant. We use a
+    # square (not circle) because Tk PhotoImage.put has no native circle
+    # primitive and per-pixel plotting for an antialiased disc is too slow
+    # to call on a blink timer. The visual is fine for an icon-sized dot.
+    dot_size = max(4, w // 3)
+    x0 = max(0, w - dot_size - 1)
+    y0 = max(0, h - dot_size - 1)
+    red = "#dc2626"
+    try:
+        for y in range(y0, h):
+            variant.put(red, to=(x0, y, w, y + 1))
+    except Exception:
+        return base_icon
+    return variant
+
+
 class ToolTip:
     def __init__(self, widget, text_fn):
         self.widget = widget
@@ -3421,7 +3466,12 @@ class MuesliApp(tk.Tk):
             detail="Reading icon assets and checking Windows launch integration.",
         )
         self._icon_idle = _load_app_icon(self)
-        self._icon_rec  = self._icon_idle
+        # _icon_rec is the steady recording variant (red dot overlay). The
+        # blink alternates between _icon_idle and _icon_rec via a Tk after()
+        # timer driven by _apply_recording_state — see _start_blink_timer.
+        self._icon_rec = _make_recording_variant_icon(self, self._icon_idle)
+        self._blink_id = None
+        self._blink_state = False  # current frame: False=idle, True=rec
         self._notepad_icon = self._load_detail_icon(NOTEPAD_ICON_PNG)
         self._copy_icon = self._load_detail_icon(COPY_ICON_PNG)
         self.wm_iconphoto(True, self._icon_idle)
@@ -4385,7 +4435,9 @@ class MuesliApp(tk.Tk):
         """Single source of truth for recording-state UI. Updates _recording flag,
         button text/colors, taskbar icon, and status_var atomically so the CTA
         and the status text can never disagree (the symptom of the
-        recording-cta-status-consistency bug)."""
+        recording-cta-status-consistency bug). Also drives the blink-icon
+        animation that makes the recording state visible across all surfaces
+        (taskbar + tray, recording-state-icon-all-surfaces task)."""
         self._recording = bool(active)
         if active:
             self._rec_btn.configure_button(
@@ -4395,7 +4447,7 @@ class MuesliApp(tk.Tk):
                 active_bg="#1f2937",
                 shadow="#c7d0db",
             )
-            self.wm_iconphoto(True, self._icon_rec)
+            self._start_blink_timer()
             if status_text is None:
                 status_text = "Recording..."
         else:
@@ -4406,10 +4458,35 @@ class MuesliApp(tk.Tk):
                 active_bg="#b42318",
                 shadow="#e8b3b3",
             )
-            self.wm_iconphoto(True, self._icon_idle)
+            self._stop_blink_timer()
             if status_text is None:
                 status_text = "Ready"
         self._status_var.set(status_text)
+
+    def _start_blink_timer(self):
+        """Begin the 600ms blink between idle and recording icons. Idempotent —
+        re-entrant calls reset to the same cadence rather than stacking timers."""
+        self._stop_blink_timer()
+        self._blink_state = True
+        self.wm_iconphoto(True, self._icon_rec)
+        self._blink_id = self.after(600, self._tick_blink)
+
+    def _tick_blink(self):
+        if not self._recording:
+            return
+        self._blink_state = not self._blink_state
+        self.wm_iconphoto(True, self._icon_rec if self._blink_state else self._icon_idle)
+        self._blink_id = self.after(600, self._tick_blink)
+
+    def _stop_blink_timer(self):
+        if self._blink_id is not None:
+            try:
+                self.after_cancel(self._blink_id)
+            except Exception:
+                pass
+            self._blink_id = None
+        self._blink_state = False
+        self.wm_iconphoto(True, self._icon_idle)
 
     def _start_recording(self):
         if not self._recording_available:
@@ -5597,7 +5674,13 @@ class DetailPanel(tk.Frame):
 
     def _draw_process_diagram(self):
         canvas = self._process_canvas
-        width = max(canvas.winfo_width(), 420)
+        # Use the actual canvas width so the connector lines between dots
+        # shorten as the detail pane narrows (process-graph-responsive-layout
+        # task). The previous floor of 420 forced a wide layout that clipped
+        # the right-most dots when the pane was narrower than ~420px.
+        # Floor of 200 just keeps the diagram from collapsing into the dots
+        # themselves when the pane is dragged absurdly narrow.
+        width = max(canvas.winfo_width(), 200)
         canvas.delete("all")
         steps = [
             ("audio", "Audio"),
@@ -5612,9 +5695,12 @@ class DetailPanel(tk.Frame):
             "done": ("#10b981", "#047857"),
             "error": ("#ef4444", "#b91c1c"),
         }
-        margin_x = 34
         radius = 11
         track_y = 24
+        # Scale the side margin with canvas width so narrow panes don't waste
+        # connector budget on padding. 34px feels right at 420+; smaller
+        # below that down to a 14px minimum.
+        margin_x = max(14, min(34, int(width * 0.08)))
         spacing = (width - (margin_x * 2)) / max(1, len(steps) - 1)
         centers = [margin_x + (spacing * idx) for idx in range(len(steps))]
         for idx in range(len(centers) - 1):

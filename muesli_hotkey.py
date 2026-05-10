@@ -524,7 +524,16 @@ class TraySidecar:
         if not self._nid:
             return
         recording = bool(state.get("recording", False))
-        desired_icon = self._icon_recording if recording and self._icon_recording else self._icon_idle
+        # When recording, alternate between idle and recording icons every
+        # _refresh_tray tick to produce a visible "blinking red dot" pulse
+        # on the tray (recording-state-icon-all-surfaces task). When idle,
+        # always pin to the idle icon.
+        if recording and self._icon_recording:
+            self._blink_phase = not getattr(self, "_blink_phase", False)
+            desired_icon = self._icon_recording if self._blink_phase else self._icon_idle
+        else:
+            self._blink_phase = False
+            desired_icon = self._icon_idle
         icon_changed = desired_icon != self._icon
         if icon_changed:
             self._icon = desired_icon
