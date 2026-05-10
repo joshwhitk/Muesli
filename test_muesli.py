@@ -1206,6 +1206,80 @@ check("MCP exposes resume_processing tool",
 check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_source)
 
+# 17j. SECURITY: slug + media-path validation in muesli_service.
+import muesli_service as muesli_service_for_security
+check("muesli_service._validate_slug exists",
+      callable(getattr(muesli_service_for_security, "_validate_slug", None)))
+check("muesli_service._validate_media_path exists",
+      callable(getattr(muesli_service_for_security, "_validate_media_path", None)))
+# Slug validator: real Muesli slugs survive, traversal slugs are rejected.
+slug_legit = ["2026-04-22_10-30-00", "abc-123_xyz", "a", "x" * 128]
+slug_evil = ["../../etc/passwd", "..\\..\\Windows\\System32", "/etc/passwd",
+             "..", ".hidden", "with space", "with/slash", "with\\backslash",
+             "with:colon", "x" * 129, "", None]
+for legit in slug_legit:
+    accepted = True
+    try:
+        muesli_service_for_security._validate_slug(legit)
+    except ValueError:
+        accepted = False
+    check(f"slug accepted: {legit!r}", accepted)
+for evil in slug_evil:
+    rejected = False
+    try:
+        muesli_service_for_security._validate_slug(evil)
+    except ValueError:
+        rejected = True
+    check(f"slug rejected: {evil!r}", rejected)
+# Media-path validator: existence + audio extension + allow-listed root.
+# OS tempdir is allowed (drag-and-drop / download flows), so place the
+# rogue fixture at ~/<random> which is outside every allow-listed root.
+sec_tmp = _tempfile.mkdtemp(prefix="muesli-rogue-test-",
+                            dir=os.path.expanduser("~"))
+try:
+    rogue_wav = os.path.join(sec_tmp, "rogue.wav")
+    open(rogue_wav, "wb").write(b"RIFF" + b"\0" * 100)
+    rejected = False
+    try:
+        muesli_service_for_security._validate_media_path(rogue_wav)
+    except PermissionError:
+        rejected = True
+    check("media path outside allow-listed roots rejected (PermissionError)",
+          rejected, detail=f"path={rogue_wav}")
+    rejected = False
+    try:
+        muesli_service_for_security._validate_media_path(os.path.join(sec_tmp, "missing.wav"))
+    except FileNotFoundError:
+        rejected = True
+    check("missing media path rejected (FileNotFoundError)", rejected)
+    home_docs = os.path.join(os.path.expanduser("~"), "Documents")
+    if os.path.isdir(home_docs):
+        wrong_ext = os.path.join(home_docs, "muesli-test-secret.txt")
+        try:
+            open(wrong_ext, "wb").write(b"x")
+            rejected = False
+            try:
+                muesli_service_for_security._validate_media_path(wrong_ext)
+            except ValueError:
+                rejected = True
+            check("non-audio extension rejected (ValueError)", rejected)
+        finally:
+            try: os.remove(wrong_ext)
+            except OSError: pass
+finally:
+    _shutil.rmtree(sec_tmp, ignore_errors=True)
+# Source-pattern guards against a future refactor bypassing the validators.
+sec_service_source = open(os.path.join(REPO_DIR, "muesli_service.py"), encoding="utf-8").read()
+check("_require_note + DELETE + PUT + reprocess wired to _validate_slug",
+      "_validate_slug(slug)" in sec_service_source
+      and "safe_slug = _validate_slug(segments[1])" in sec_service_source
+      and "_validate_slug(body.get(\"slug\"))" in sec_service_source)
+check("transcribe-file + ingest-voice-note wired to _validate_media_path",
+      "_validate_media_path(body.get(\"path\"))" in sec_service_source)
+check("PermissionError -> 403 in every method handler",
+      sec_service_source.count("self._send_json(403, {\"error\": str(exc)})") >= 4)
+
+
 # 17h. recording-state-icon-all-surfaces: blink driven by _apply_recording_state
 #      across taskbar (Tk wm_iconphoto) and tray (muesli_hotkey.py).
 check("_make_recording_variant_icon helper defined",

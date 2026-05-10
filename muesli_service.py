@@ -6,6 +6,7 @@ import datetime
 import json
 import mimetypes
 import os
+import re
 import threading
 import traceback
 import uuid
@@ -17,6 +18,114 @@ from muesli import Muesli
 from muesli_runtime import is_processing_paused, set_processing_paused
 
 DEFAULT_PORT = 8765
+
+
+# ── Input validation (security boundary) ─────────────────────────────────────
+# Two critical attacker-controlled inputs hit the filesystem:
+#   * `slug` from URL segments + request body — fed into os.path.join under
+#     REC_DIR / SHARED_DIR. Without validation, a slug like '../../etc/passwd'
+#     escapes the data dir. delete_session is the worst case because it
+#     unlinks files matching `slug + .json/.wav/.mp3/.txt`.
+#   * `path` body field on /jobs/transcribe-file and /jobs/ingest-voice-note —
+#     passed straight to FFmpeg. Without confinement, an attacker on the same
+#     machine can force-transcribe arbitrary files (private keys, browser
+#     cookies, etc.) and read leaked content via the transcript field.
+
+# Slugs must be alphanumeric/underscore/dash, start with alphanumeric, and be
+# 1-128 chars. Real Muesli slugs look like '2026-04-22_10-30-00' so this is
+# strictly more permissive than what the recorder actually emits.
+SAFE_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,127}$")
+
+ALLOWED_AUDIO_EXTS = frozenset({
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus", ".wma",
+})
+
+
+def _validate_slug(slug):
+    """Reject slugs that aren't safe for filesystem use. Raises ValueError so
+    the handler returns 400 instead of letting `os.path.join(REC_DIR, slug+...)`
+    escape the data directory."""
+    s = str(slug or "").strip()
+    if not SAFE_SLUG_RE.match(s):
+        raise ValueError(
+            f"Invalid slug {s!r}. Slugs must be 1-128 chars, alphanumeric / "
+            "underscore / dash only, and start with an alphanumeric. Path "
+            "separators and '..' are rejected."
+        )
+    return s
+
+
+def _allowed_media_roots():
+    """Roots that /jobs/transcribe-file and /jobs/ingest-voice-note `path`
+    arguments must resolve inside. Real-resolves so symlink escapes are
+    caught. Includes Muesli's own media dirs, the user's standard media
+    folders, the OS temp dir (drag-and-drop and download-then-feed flows
+    typically land there), and anything in config.json
+    `service_allowed_dirs`. The exclusion that matters is system / user
+    secrets dirs (~/.ssh, AppData/Roaming with browser cookies, etc.) —
+    those would never be in this list, so an attacker can't aim FFmpeg
+    at them and exfiltrate via the transcript field."""
+    import tempfile as _tempfile
+    home = os.path.expanduser("~")
+    candidates = [
+        getattr(muesli, "SHARED_DIR", None),
+        getattr(muesli, "REC_DIR", None),
+        os.path.join(home, "Documents"),
+        os.path.join(home, "Downloads"),
+        os.path.join(home, "Music"),
+        os.path.join(home, "Desktop"),
+        _tempfile.gettempdir(),
+    ]
+    try:
+        cfg = muesli._load_config() if hasattr(muesli, "_load_config") else {}
+    except Exception:
+        cfg = {}
+    extra = cfg.get("service_allowed_dirs") if isinstance(cfg, dict) else None
+    if isinstance(extra, list):
+        candidates.extend(p for p in extra if isinstance(p, str) and p)
+    seen = set()
+    roots = []
+    for raw in candidates:
+        if not raw:
+            continue
+        try:
+            r = os.path.realpath(os.path.abspath(raw))
+        except (OSError, ValueError):
+            continue
+        if r and r not in seen:
+            seen.add(r)
+            roots.append(r)
+    return roots
+
+
+def _validate_media_path(path):
+    """Reject media paths outside the allow-listed roots or with extensions
+    that aren't audio containers. Raises FileNotFoundError if missing,
+    ValueError for bad extension, PermissionError for out-of-root."""
+    raw = str(path or "").strip()
+    if not raw:
+        raise FileNotFoundError("Missing audio path")
+    resolved = os.path.realpath(os.path.abspath(raw))
+    if not os.path.exists(resolved):
+        raise FileNotFoundError(raw)
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext not in ALLOWED_AUDIO_EXTS:
+        raise ValueError(
+            f"Audio path must have a recognised audio extension (one of "
+            f"{sorted(ALLOWED_AUDIO_EXTS)}); got {ext or '(none)'}."
+        )
+    roots = _allowed_media_roots()
+    for root in roots:
+        try:
+            common = os.path.commonpath([resolved, root])
+        except ValueError:
+            continue
+        if common == root:
+            return resolved
+    raise PermissionError(
+        f"Audio path {raw!r} is outside the allowed media roots. Add the "
+        f"folder to config.json `service_allowed_dirs` if you trust it."
+    )
 
 
 def _utc_now():
@@ -407,6 +516,9 @@ def _make_handler(service, port):
             return segments, query
 
         def _require_note(self, slug):
+            # Validate before any filesystem use so a malicious slug like
+            # '../../etc/passwd' returns 400 instead of escaping REC_DIR.
+            slug = _validate_slug(slug)
             note = service.get_note(slug)
             if not note:
                 self._send_json(404, {"error": f"No session found for slug {slug}"})
@@ -471,6 +583,8 @@ def _make_handler(service, port):
                 return self._send_json(404, {"error": "Unknown endpoint"})
             except FileNotFoundError as exc:
                 return self._send_json(404, {"error": str(exc)})
+            except PermissionError as exc:
+                return self._send_json(403, {"error": str(exc)})
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
             except Exception as exc:
@@ -498,17 +612,16 @@ def _make_handler(service, port):
                     set_processing_paused(False)
                     return self._send_json(200, {"paused": False})
                 if segments == ["jobs", "transcribe-file"]:
-                    path = str(body.get("path") or "").strip()
-                    if not path or not os.path.exists(path):
-                        raise FileNotFoundError(path or "Missing audio path")
-                    return self._send_json(202, service.submit_transcribe_file(path))
+                    # _validate_media_path: existence + audio extension +
+                    # confined to allow-listed roots. Stops attackers feeding
+                    # /etc/passwd or ~/.ssh/id_rsa to FFmpeg.
+                    safe_path = _validate_media_path(body.get("path"))
+                    return self._send_json(202, service.submit_transcribe_file(safe_path))
                 if segments == ["jobs", "ingest-voice-note"]:
-                    path = str(body.get("path") or "").strip()
-                    if not path or not os.path.exists(path):
-                        raise FileNotFoundError(path or "Missing audio path")
-                    return self._send_json(202, service.submit_ingest_voice_note(path))
+                    safe_path = _validate_media_path(body.get("path"))
+                    return self._send_json(202, service.submit_ingest_voice_note(safe_path))
                 if segments == ["jobs", "reprocess-note"]:
-                    slug = str(body.get("slug") or "").strip()
+                    slug = _validate_slug(body.get("slug"))
                     if not slug:
                         raise ValueError("Missing slug")
                     force_transcribe = body.get("force_transcribe", True)
@@ -524,6 +637,8 @@ def _make_handler(service, port):
                 return self._send_json(404, {"error": "Unknown endpoint"})
             except FileNotFoundError as exc:
                 return self._send_json(404, {"error": str(exc)})
+            except PermissionError as exc:
+                return self._send_json(403, {"error": str(exc)})
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
             except Exception as exc:
@@ -534,12 +649,15 @@ def _make_handler(service, port):
                 segments, _query = self._split()
                 body = self._read_json_body()
                 if len(segments) == 4 and segments[0] == "notes" and segments[2] == "components":
+                    safe_slug = _validate_slug(segments[1])
                     value = body.get("value")
-                    note = service.overwrite_component(segments[1], segments[3], value)
+                    note = service.overwrite_component(safe_slug, segments[3], value)
                     return self._send_json(200, note)
                 return self._send_json(404, {"error": "Unknown endpoint"})
             except FileNotFoundError as exc:
                 return self._send_json(404, {"error": str(exc)})
+            except PermissionError as exc:
+                return self._send_json(403, {"error": str(exc)})
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
             except Exception as exc:
@@ -549,11 +667,22 @@ def _make_handler(service, port):
             try:
                 segments, _query = self._split()
                 if len(segments) == 2 and segments[0] == "notes":
-                    deleted = service.delete_note(segments[1])
+                    # Slug validation is critical here: delete_session removes
+                    # files matching `slug + .json/.wav/.mp3/.txt`. An
+                    # unsanitised '../../foo' would let an attacker on
+                    # localhost delete arbitrary files in those extensions.
+                    safe_slug = _validate_slug(segments[1])
+                    deleted = service.delete_note(safe_slug)
                     if not deleted:
-                        return self._send_json(404, {"error": f"No session found for slug {segments[1]}"})
-                    return self._send_json(200, {"deleted": True, "slug": segments[1]})
+                        return self._send_json(404, {"error": f"No session found for slug {safe_slug}"})
+                    return self._send_json(200, {"deleted": True, "slug": safe_slug})
                 return self._send_json(404, {"error": "Unknown endpoint"})
+            except FileNotFoundError as exc:
+                return self._send_json(404, {"error": str(exc)})
+            except PermissionError as exc:
+                return self._send_json(403, {"error": str(exc)})
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
             except Exception as exc:
                 return self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
 
