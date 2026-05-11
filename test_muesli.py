@@ -622,8 +622,13 @@ check("Hotkey tray owner-draws menu items for explicit readable colors",
 shortcut_script = open(os.path.join(os.path.dirname(__file__), "refresh_windows_shortcuts.ps1"), "r", encoding="utf-8").read()
 check("shortcut refresh stamps AppUserModelID and relaunch icon metadata",
       'SetAppDetails' in shortcut_script and 'PROPERTYKEY(AppUserModelGuid, 5)' in shortcut_script and 'PROPERTYKEY(AppUserModelGuid, 3)' in shortcut_script)
-check("shortcut refresh launches sidecar with hidden python.exe and startup wscript wrapper",
-      'Start-Process -FilePath $python' in shortcut_script and
+check("shortcut refresh launches sidecar through the .vbs (single source of venv resolution)",
+      # Was: Start-Process -FilePath $python ... — bypassed the off-Dropbox-first
+      # venv resolution in muesli_hotkey_launcher.vbs and re-introduced the
+      # Python 3.14 import wedge after the venv migration. Now goes through
+      # the .vbs so it picks up the same %LOCALAPPDATA%\muesli\.venv install.
+      'Start-Process -FilePath $wscript -ArgumentList' in shortcut_script and
+      'hotkeyLauncher' in shortcut_script and
       'TargetPath $wscript' in shortcut_script and
       'muesli_hotkey_launcher.vbs' in shortcut_script)
 check("shortcut refresh writes desktop and record launchers through the GUI wrapper",

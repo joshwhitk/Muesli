@@ -6,7 +6,21 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$python = Join-Path $root ".venv\Scripts\python.exe"
+# Resolve the venv with the same precedence the .vbs launchers use:
+# MUESLI_VENV env > %LOCALAPPDATA%\muesli\.venv > legacy in-source .venv\.
+# The off-Dropbox install is preferred so this script keeps working after
+# the in-source .venv\ is removed via Dropbox UI.
+$envVenv = $env:MUESLI_VENV
+$defaultVenv = Join-Path $env:LOCALAPPDATA "muesli\.venv"
+$legacyVenv = Join-Path $root ".venv"
+if ($envVenv -and (Test-Path $envVenv)) {
+    $venvRoot = $envVenv
+} elseif (Test-Path $defaultVenv) {
+    $venvRoot = $defaultVenv
+} else {
+    $venvRoot = $legacyVenv
+}
+$python = Join-Path $venvRoot "Scripts\python.exe"
 $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
 $icon = Join-Path $root "assets\muesli-icon.ico"
 $appId = "Muesli.App"
@@ -206,6 +220,9 @@ if (-not $SkipHotkeyRestart) {
             Where-Object { ($_.Name -eq "pythonw.exe" -or $_.Name -eq "python.exe") -and $_.CommandLine -match "muesli_hotkey.py" } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Milliseconds 300
-        Start-Process -FilePath $python -ArgumentList ('"' + $hotkeyScript + '"') -WorkingDirectory $root -WindowStyle Hidden
+        # Spawn through the .vbs launcher (not python directly) so it goes
+        # through the same off-Dropbox-first venv resolution as the Startup
+        # shortcut. Single source of truth: the .vbs.
+        Start-Process -FilePath $wscript -ArgumentList ('"' + $hotkeyLauncher + '"') -WorkingDirectory $root -WindowStyle Hidden
     }
 }

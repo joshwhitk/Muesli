@@ -94,6 +94,31 @@ LRESULT = getattr(wintypes, "LRESULT", wintypes.LPARAM)
 HCURSOR = getattr(wintypes, "HCURSOR", wintypes.HANDLE)
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
+# Explicit argtypes/restype on the Win32 functions we call. Without these,
+# Python 3.12+ ctypes marshals HMODULE/HINSTANCE returns as Python ints,
+# and any value with the high bit set raises `OverflowError: int too long
+# to convert` when passed back into another API. Worked accidentally on
+# Python 3.14 because the marshalling there was more permissive.
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+kernel32.GetLastError.restype = wintypes.DWORD
+user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD,        # dwExStyle
+    wintypes.LPCWSTR,      # lpClassName
+    wintypes.LPCWSTR,      # lpWindowName
+    wintypes.DWORD,        # dwStyle
+    ctypes.c_int,          # X
+    ctypes.c_int,          # Y
+    ctypes.c_int,          # nWidth
+    ctypes.c_int,          # nHeight
+    wintypes.HWND,         # hWndParent
+    wintypes.HMENU,        # hMenu
+    wintypes.HINSTANCE,    # hInstance
+    wintypes.LPVOID,       # lpParam
+]
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.RegisterClassW.restype = ctypes.c_uint16  # ATOM
+
 
 class GUID(ctypes.Structure):
     _fields_ = [
