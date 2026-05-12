@@ -196,6 +196,26 @@ check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_src)
 
 
+# ── 17k. _effective_summary_runtime is cached ───────────────────────────────
+# Without caching, the 1s _poll_runtime_state tick blocks the main thread on
+# `_selected_ollama_model() -> _list_ollama_models() -> /api/tags` (3+ seconds
+# on a cold ollama). That makes the Tk event loop fall behind, the window
+# becomes unresponsive, and clicks (delete, select track) stall. Reproduced
+# live on 2026-05-12.
+print("\n[17k] _effective_summary_runtime cache prevents poll-blocking")
+check("TTL constant + cache slot exist",
+      "_EFFECTIVE_SUMMARY_RUNTIME_TTL_S = 30.0" in gui_src
+      and "_effective_summary_runtime_cache" in gui_src)
+check("compute helper is split out from the cached entry point",
+      "def _compute_effective_summary_runtime" in gui_src
+      and "def _effective_summary_runtime" in gui_src)
+check("cache invalidator exists and is called from _open_settings",
+      "def _invalidate_summary_runtime_cache" in gui_src
+      and "self._invalidate_summary_runtime_cache()" in gui_src)
+check("_effective_summary_runtime returns the cached tuple on TTL hit",
+      "(now - cache[0]) < self._EFFECTIVE_SUMMARY_RUNTIME_TTL_S" in gui_src)
+
+
 # ── 17j. SECURITY: slug + media-path validation ─────────────────────────────
 print("\n[17j] SECURITY: slug + media-path validation")
 import muesli_service

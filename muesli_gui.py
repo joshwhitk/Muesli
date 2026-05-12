@@ -3437,6 +3437,8 @@ class MuesliApp(tk.Tk):
         self._realtime_transcriber = None
         self._realtime_turn_order = []
         self._realtime_turns = {}
+        # (timestamp, (backend, model)) — see _effective_summary_runtime.
+        self._effective_summary_runtime_cache = None
         self._live_preview = None
         self._live_manual_title = ""
         self._live_manual_title_active = False
@@ -4009,6 +4011,10 @@ class MuesliApp(tk.Tk):
             return
         _reset_whisper_cache()
         _reset_llm_cache()
+        # Settings change can flip llm_backend / ollama_model — drop the
+        # _effective_summary_runtime cache so the next poll sees the new
+        # value without waiting up to 30s.
+        self._invalidate_summary_runtime_cache()
         self._refresh_llm_warning()
         self._publish_runtime_state()
         self._status_var.set("Settings saved")
@@ -4029,7 +4035,36 @@ class MuesliApp(tk.Tk):
         paused = is_processing_paused()
         self._pause_btn.configure_button(text="Resume Processing" if paused else "Pause Processing")
 
+    # _effective_summary_runtime hits ollama (`/api/tags`) and the filesystem
+    # (gguf model search + importlib spec lookups). Each ollama call can be
+    # 3+ seconds on this PC right after boot. _poll_runtime_state ticks every
+    # 1000ms, so without caching the main thread blocks ~3s per second and the
+    # Tk event loop falls behind — Responding=False, cursor spins, every UX
+    # action (delete, select track) stalls. This is a pre-existing latency bug
+    # surfaced after the May 2026 cold-launch trace work made the polling
+    # cadence visible.
+    #
+    # Cache TTL is intentionally long (30s). The summary backend is a config
+    # value the user edits in Settings — we invalidate the cache there
+    # explicitly via `_invalidate_summary_runtime_cache()`. Anything else that
+    # changes the answer (e.g., user installs a new ollama model) gets picked
+    # up on the next 30s tick at worst, which is fine for an informational
+    # tray-tooltip field.
+    _EFFECTIVE_SUMMARY_RUNTIME_TTL_S = 30.0
+
+    def _invalidate_summary_runtime_cache(self):
+        self._effective_summary_runtime_cache = None
+
     def _effective_summary_runtime(self):
+        cache = getattr(self, "_effective_summary_runtime_cache", None)
+        now = time.monotonic()
+        if cache is not None and (now - cache[0]) < self._EFFECTIVE_SUMMARY_RUNTIME_TTL_S:
+            return cache[1]
+        result = self._compute_effective_summary_runtime()
+        self._effective_summary_runtime_cache = (now, result)
+        return result
+
+    def _compute_effective_summary_runtime(self):
         cfg = load_config()
         backend = _llm_backend()
         if backend == "anthropic":

@@ -1211,6 +1211,18 @@ check("MCP exposes resume_processing tool",
 check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_source)
 
+# 17k. _effective_summary_runtime cache — prevents the 1s poll loop from
+#      blocking the main thread on a 3s ollama /api/tags call.
+check("TTL constant + cache slot defined",
+      "_EFFECTIVE_SUMMARY_RUNTIME_TTL_S = 30.0" in gui_source
+      and "_effective_summary_runtime_cache" in gui_source)
+check("compute split from cached entry point",
+      "def _compute_effective_summary_runtime" in gui_source)
+check("Settings save invalidates the cache",
+      "def _invalidate_summary_runtime_cache" in gui_source
+      and "self._invalidate_summary_runtime_cache()" in gui_source)
+
+
 # 17j. SECURITY: slug + media-path validation in muesli_service.
 import muesli_service as muesli_service_for_security
 check("muesli_service._validate_slug exists",
