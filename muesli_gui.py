@@ -2836,18 +2836,30 @@ class Recorder:
 class Player:
     """Thin wrapper around pygame.mixer.music."""
     def __init__(self):
-        pygame.mixer.pre_init(44100, -16, 2, 1024)
-        pygame.mixer.init()
+        # Lazy-init pygame.mixer. pygame.mixer.init() opens an SDL audio
+        # device which takes 5-10s on Windows (DirectSound enumeration).
+        # Player() is constructed in MuesliApp.__init__ on the Tk main
+        # thread, so eager init blocks startup. The first .load() / .play()
+        # pays the cost; users who never play audio never pay it.
+        self._mixer_ready = False
         self._path       = None
         self._state      = "stopped"   # stopped | playing | paused
         self._play_epoch = 0.0         # wall time when last play() called
         self._pause_pos  = 0.0         # position (s) at last pause
+
+    def _ensure_mixer(self):
+        if self._mixer_ready:
+            return
+        pygame.mixer.pre_init(44100, -16, 2, 1024)
+        pygame.mixer.init()
+        self._mixer_ready = True
 
     def load(self, path):
         if self._path == path:
             return
         self.stop()
         self._path = path
+        self._ensure_mixer()
         pygame.mixer.music.load(path)
 
     def play(self):
@@ -2868,17 +2880,23 @@ class Player:
             self._state = "paused"
 
     def stop(self):
-        pygame.mixer.music.stop()
+        # Guarded: stop() may be called before any audio was loaded
+        # (e.g., during _start_recording cleanup), and pygame.mixer.music
+        # raises if mixer isn't initialised. Lazy mixer means we just
+        # have nothing to stop in that case.
+        if self._mixer_ready:
+            pygame.mixer.music.stop()
         self._state     = "stopped"
         self._pause_pos = 0.0
 
     def clear(self):
         self.stop()
-        try:
-            if hasattr(pygame.mixer.music, "unload"):
-                pygame.mixer.music.unload()
-        except Exception:
-            pass
+        if self._mixer_ready:
+            try:
+                if hasattr(pygame.mixer.music, "unload"):
+                    pygame.mixer.music.unload()
+            except Exception:
+                pass
         self._path = None
 
     def toggle(self):
@@ -2893,8 +2911,9 @@ class Player:
 
     @property
     def state(self):
-        # Detect natural end-of-track
-        if self._state == "playing" and not pygame.mixer.music.get_busy():
+        # Detect natural end-of-track. If mixer isn't init'd, we can't be
+        # playing (state machine wouldn't allow it), so skip the check.
+        if self._state == "playing" and self._mixer_ready and not pygame.mixer.music.get_busy():
             self._state     = "stopped"
             self._pause_pos = 0.0
         return self._state
@@ -3563,11 +3582,17 @@ class MuesliApp(tk.Tk):
         self._notepad_icon = self._load_detail_icon(NOTEPAD_ICON_PNG)
         self._copy_icon = self._load_detail_icon(COPY_ICON_PNG)
         self.wm_iconphoto(True, self._icon_idle)
-        ensure_windows_shortcuts_if_missing()
+        # Defer the shortcut audit to after the window appears.
+        # ensure_windows_shortcuts_if_missing() takes 3-5s on first run
+        # because it walks Desktop / Start Menu / Startup / TaskBar dirs
+        # and rewrites .lnk files via WScript.Shell COM. Doing it on the
+        # Tk main thread blocks startup. Deferring 2s is safe — the
+        # shortcuts only matter for next-launch, not this one.
+        self.after(2000, ensure_windows_shortcuts_if_missing)
         self._launch_probe.end(
             "icons_and_shortcuts_ready",
             stage="Loading icons and shortcuts...",
-            detail="Icons loaded and launch integration checked.",
+            detail="Icons loaded; shortcut audit deferred 2s.",
             threshold_ms=1200,
             progress=45,
         )
