@@ -1221,6 +1221,44 @@ check("hotkey launcher prefers pythonw.exe over python.exe",
       and 'Chr(34) & selectedPython & Chr(34)' in hotkey_launcher_source)
 
 
+# 17o. Silence-hallucination defence: RMS gate before whisper + empty
+#      transcript gate before LLM. Catches the 2026-05-13 live-test bug
+#      where 8s of mic silence -> whisper "" -> LLM produced fake meeting.
+muesli_module_source = open(os.path.join(REPO_DIR, "muesli.py"), encoding="utf-8").read()
+check("muesli has _audio_rms + _audio_is_silent helpers",
+      "def _audio_rms(" in muesli_module_source
+      and "def _audio_is_silent(" in muesli_module_source)
+check("transcribe_with_progress short-circuits on silent audio",
+      "if _audio_is_silent(audio_file_path):" in muesli_module_source)
+check("Muesli.summarize gates LLM on transcripts under 12 chars",
+      "len(transcript.strip()) < 12" in muesli_module_source
+      and '"title": "(no audible speech)"' in muesli_module_source)
+check("muesli_gui._generate_ai_fields mirrors the empty-transcript LLM gate",
+      "len(text.strip()) < 12" in gui_source
+      and '"title": "(no audible speech)"' in gui_source)
+# Functional: silent WAV via existing make_silent_wav helper.
+silent_test_wav = os.path.join(TEST_HOME, "silent-fixture.wav")
+make_silent_wav(silent_test_wav, duration_s=2)
+check("RMS of all-zero WAV is below SILENCE_RMS_THRESHOLD_DEFAULT",
+      muesli_module._audio_rms(silent_test_wav) < muesli_module.SILENCE_RMS_THRESHOLD_DEFAULT)
+check("_audio_is_silent returns True for the silent fixture",
+      muesli_module._audio_is_silent(silent_test_wav))
+# Functional: summarize on empty transcript returns placeholder + doesn't
+# touch the LLM. (FAKE_LLM_JSON is patched into _llm_generate at the top
+# of this file — if the gate fails, the test would see "Test Session"
+# in the result, not "(no audible speech)".)
+silent_summary = muesli_module.Muesli().summarize("")
+check("Muesli.summarize('') returns the no-speech placeholder",
+      silent_summary.get("title") == "(no audible speech)"
+      and silent_summary.get("summary") == ""
+      and silent_summary.get("speakers") == 0)
+real_summary = muesli_module.Muesli().summarize(
+    "This is a normal transcript with enough content to summarise."
+)
+check("Muesli.summarize(real transcript) still goes through the LLM",
+      real_summary.get("title") == "Test Session")  # from FAKE_LLM_JSON
+
+
 # 17n. Lazy transcript load — idle GUI doesn't burn CPU.
 detail_class_start = gui_source.find("class DetailPanel(tk.Frame):")
 detail_class_end = gui_source.find("\nclass ", detail_class_start + 1)

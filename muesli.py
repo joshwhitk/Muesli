@@ -599,6 +599,74 @@ def _get_whisper(prefer_cpu=False, reset=False):
     return _whisper_model
 
 
+# ── Silence detection (whisper hallucinates on silent input) ─────────────────
+# Whisper is famous for confidently inventing transcripts on silent audio
+# ("Thank you for watching!", "[music]", repeated phrases from training
+# data). Worse, even when whisper correctly returns an empty transcript,
+# the downstream summarizer LLM will happily hallucinate a full fake
+# meeting from nothing — repro'd live 2026-05-13: 8s of ambient mic
+# silence yielded title "API Development Update" with a 5-sentence
+# fake summary about "API development progress".
+#
+# Defence: RMS energy gate on the audio. If average amplitude is below
+# threshold, treat as silence and skip both whisper and the LLM. The
+# session is still saved (so the user sees "I tried to record but
+# nothing was captured") but with empty title/summary instead of
+# fabricated content.
+#
+# Threshold: 200 in raw int16 units = ~-44 dBFS. Below ambient room
+# tone for most setups, well below quiet speech (~-30 dBFS). Tunable
+# via config["silence_rms_threshold"].
+SILENCE_RMS_THRESHOLD_DEFAULT = 200
+
+
+def _audio_rms(audio_file_path):
+    """RMS amplitude (raw int16 units) of a WAV file. Returns float('inf')
+    on any read error (unknown extension, missing file, can't open with
+    `wave`, non-PCM codec, ...) so the caller treats 'unreadable' as
+    'not silent' and falls through to the real transcriber. Returning
+    0.0 here would silence-gate every file we can't sniff (mp3, m4a,
+    missing test fixtures), which would silently break legitimate flows."""
+    try:
+        import wave as _wave
+        import struct as _struct
+        with _wave.open(str(audio_file_path), "rb") as wf:
+            n_frames = wf.getnframes()
+            if n_frames == 0:
+                return 0.0
+            sample_width = wf.getsampwidth()
+            channels = wf.getnchannels()
+            # Read up to ~5s of samples — enough to reliably gauge silence
+            # without slurping a multi-hour file just to check energy.
+            framerate = wf.getframerate()
+            sample_cap = framerate * 5 * channels
+            read_n = min(n_frames, sample_cap // channels) if channels else n_frames
+            raw = wf.readframes(read_n)
+        if sample_width == 2:
+            count = len(raw) // 2
+            if count == 0:
+                return 0.0
+            samples = _struct.unpack(f"<{count}h", raw)
+            sq_sum = sum(s * s for s in samples)
+            return (sq_sum / count) ** 0.5
+        # Other widths (8-bit, 24-bit, 32-bit) are uncommon for muesli
+        # recordings; treat as 'not silent' to avoid false-discards.
+        return float("inf")
+    except Exception:
+        return float("inf")
+
+
+def _audio_is_silent(audio_file_path, threshold=None):
+    """True if the audio's RMS amplitude is below the silence threshold."""
+    if threshold is None:
+        try:
+            cfg = _load_config()
+            threshold = float(cfg.get("silence_rms_threshold") or SILENCE_RMS_THRESHOLD_DEFAULT)
+        except Exception:
+            threshold = SILENCE_RMS_THRESHOLD_DEFAULT
+    return _audio_rms(audio_file_path) < threshold
+
+
 def _transcribe_segments(audio_file_path, **kwargs):
     try:
         model = _get_whisper()
@@ -1205,6 +1273,20 @@ class Muesli:
         wav_dest = os.path.join(self._shared_dir, slug + ".wav")
         active_summary_mode = _get_summary_mode()
 
+        # Silence gate (layer 1, audio): cheap RMS check on the WAV before
+        # ffmpeg deletes it. If silent, force transcript to "" so the LLM
+        # gate below catches it. Skips whisper too if the chunk pipeline
+        # didn't already produce a transcript.
+        if (transcript is None or not (transcript or "").strip()) and os.path.exists(wav_path):
+            try:
+                cfg = _load_config()
+                threshold = float(cfg.get("silence_rms_threshold")
+                                  or SILENCE_RMS_THRESHOLD_DEFAULT)
+                if _audio_rms(wav_path) < threshold:
+                    transcript = ""
+            except Exception:
+                pass
+
         # WAV -> MP3
         if not os.path.exists(mp3_path) and not os.path.exists(wav_dest):
             if _ffmpeg_available():
@@ -1229,22 +1311,38 @@ class Muesli:
 
         # Final summary
         llm_used = False
-        try:
-            if summaries and any(summaries):
-                merged = "\n".join(f"- {s}" for s in summaries if s)
-                prompt_text = active_summary_mode["prompt"].replace(
-                    "{transcript}",
-                    f"[Chunk summaries from a longer recording]\n{merged}",
-                )
-            else:
-                prompt_text = active_summary_mode["prompt"].replace("{transcript}", transcript or "")
-            raw = _llm_generate(prompt_text)
-            raw = re.sub(r"^```[a-z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
-            ai = json.loads(raw)
-            llm_used = True
-        except Exception:
-            ai = _fallback_ai_fields(transcript)
+        # Silence gate (layer 2, transcript): skip the LLM entirely for
+        # empty/trivial transcripts. Whisper hallucinations on near-silent
+        # input often emit short canned phrases ("Thank you.", "Bye.")
+        # which the LLM will then spin into a fake meeting (live repro
+        # 2026-05-13: 8s of mic silence → "Thank you." → "Project Risk
+        # Accountability" with fake summary about deadlines).
+        has_chunk_summaries = bool(summaries and any(summaries))
+        if not has_chunk_summaries and len((transcript or "").strip()) < 12:
+            ai = {
+                "title": "(no audible speech)",
+                "summary": "",
+                "speakers": 0,
+                "corrections": "",
+                "bugs": "",
+            }
+        else:
+            try:
+                if has_chunk_summaries:
+                    merged = "\n".join(f"- {s}" for s in summaries if s)
+                    prompt_text = active_summary_mode["prompt"].replace(
+                        "{transcript}",
+                        f"[Chunk summaries from a longer recording]\n{merged}",
+                    )
+                else:
+                    prompt_text = active_summary_mode["prompt"].replace("{transcript}", transcript or "")
+                raw = _llm_generate(prompt_text)
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+                ai = json.loads(raw)
+                llm_used = True
+            except Exception:
+                ai = _fallback_ai_fields(transcript)
 
         default_title = _default_session_title(meta.get("started_at", ""))
         title = ai.get("title", "").strip() or default_title
@@ -1371,6 +1469,15 @@ class Muesli:
 
     def transcribe_with_progress(self, audio_file_path, on_percent=None):
         """Transcribe with optional progress callback. on_percent(int) called with 0-100."""
+        # Silence gate: short-circuit before whisper to avoid the
+        # documented hallucination behaviour on silent input. Saves
+        # transcribe time too. Returns empty string — callers (notably
+        # summarize / process_recording) treat empty transcript as the
+        # "no audible content" signal and skip the LLM step.
+        if _audio_is_silent(audio_file_path):
+            if on_percent:
+                on_percent(100)
+            return ""
         if _transcription_backend() in ("openai", "openai_realtime"):
             if on_percent:
                 on_percent(5)
@@ -1404,6 +1511,22 @@ class Muesli:
 
     def summarize(self, transcript, prompt_text=None):
         """Summarise a transcript string. Returns dict with title, summary, speakers, etc."""
+        # Empty-transcript guard. Even when whisper correctly returns "" for
+        # silent input, the LLM (deepseek-r1, claude, etc.) will happily
+        # invent a complete fake meeting from nothing. Repro'd live
+        # 2026-05-13: 8s of mic silence -> whisper "" -> LLM produced
+        # title "API Development Update" with 5-sentence fake summary about
+        # "API development progress" and "backend integration risks". Hard
+        # gate at 12 chars: anything shorter than a typical "yes" response
+        # has no real content for the LLM to summarise.
+        if not transcript or len(transcript.strip()) < 12:
+            return {
+                "title": "(no audible speech)",
+                "summary": "",
+                "speakers": 0,
+                "corrections": "",
+                "bugs": "",
+            }
         prompt_text = (prompt_text or _get_summary_prompt()).replace("{transcript}", transcript)
         try:
             raw = _llm_generate(prompt_text)

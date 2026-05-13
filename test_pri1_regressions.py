@@ -259,6 +259,88 @@ check("_effective_summary_runtime returns the cached tuple on TTL hit",
       "(now - cache[0]) < self._EFFECTIVE_SUMMARY_RUNTIME_TTL_S" in gui_src)
 
 
+# ── 17o. Silence-hallucination defence ──────────────────────────────────────
+# Two layers: (a) RMS gate before whisper so silent audio doesn't get
+# whisper-hallucinated transcripts, (b) empty-transcript gate before the
+# LLM so even when whisper correctly returns "" the summarizer doesn't
+# invent a fake meeting. Live repro 2026-05-13: 8s of ambient mic
+# silence -> whisper "" -> LLM produced "API Development Update" with
+# fake 5-sentence summary about "API development progress".
+print("\n[17o] silence-hallucination defence")
+muesli_src = read("muesli.py")
+check("muesli._audio_rms helper defined",
+      "def _audio_rms(" in muesli_src)
+check("muesli._audio_is_silent helper defined",
+      "def _audio_is_silent(" in muesli_src)
+check("muesli.SILENCE_RMS_THRESHOLD_DEFAULT constant defined",
+      "SILENCE_RMS_THRESHOLD_DEFAULT" in muesli_src)
+check("transcribe_with_progress short-circuits on silent audio",
+      "if _audio_is_silent(audio_file_path):" in muesli_src)
+check("Muesli.summarize empty-transcript guard skips LLM",
+      "len(transcript.strip()) < 12" in muesli_src
+      and '"title": "(no audible speech)"' in muesli_src)
+check("muesli_gui._generate_ai_fields mirrors the empty-transcript guard",
+      "len(text.strip()) < 12" in gui_src
+      and '"title": "(no audible speech)"' in gui_src)
+
+# Functional: feed a silent WAV through _audio_rms, confirm it's below
+# the threshold; feed a noisy WAV, confirm above.
+import wave as _wave_t
+import struct as _struct_t
+import muesli as _m
+_silent_dir = tempfile.mkdtemp(prefix="muesli-pri1-silence-")
+try:
+    silent_wav = os.path.join(_silent_dir, "silent.wav")
+    with _wave_t.open(silent_wav, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+        wf.writeframes(_struct_t.pack(f"<{16000*2}h", *([0]*32000)))
+    rms_silent = _m._audio_rms(silent_wav)
+    check("RMS of all-zero WAV is ~0", rms_silent < 1.0,
+          detail=f"got {rms_silent}")
+    check("_audio_is_silent returns True for all-zero WAV",
+          _m._audio_is_silent(silent_wav))
+
+    # Loud WAV: half-amplitude sine wave samples (well above threshold)
+    import math as _math_t
+    noisy_wav = os.path.join(_silent_dir, "noisy.wav")
+    samples = [int(16000 * _math_t.sin(2 * _math_t.pi * 440 * i / 16000))
+               for i in range(16000)]
+    with _wave_t.open(noisy_wav, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+        wf.writeframes(_struct_t.pack(f"<{len(samples)}h", *samples))
+    rms_noisy = _m._audio_rms(noisy_wav)
+    check("RMS of loud sine WAV is well above threshold",
+          rms_noisy > _m.SILENCE_RMS_THRESHOLD_DEFAULT,
+          detail=f"got {rms_noisy}, threshold {_m.SILENCE_RMS_THRESHOLD_DEFAULT}")
+    check("_audio_is_silent returns False for loud sine WAV",
+          not _m._audio_is_silent(noisy_wav))
+
+    # End-to-end: silent transcript -> Muesli.summarize returns the
+    # placeholder, never calling the LLM.
+    llm_called = [False]
+    real_llm = _m._llm_generate
+    _m._llm_generate = lambda *_a, **_kw: (llm_called.__setitem__(0, True), '{"title":"FAKE","summary":"FAKE","speakers":99}')[1]
+    try:
+        result = _m.Muesli().summarize("")
+        check("summarize('') returns placeholder, doesn't call LLM",
+              result.get("title") == "(no audible speech)" and not llm_called[0],
+              detail=f"result={result} llm_called={llm_called[0]}")
+        # Trivial transcript also gated
+        llm_called[0] = False
+        result2 = _m.Muesli().summarize("ok")
+        check("summarize('ok') (under 12 chars) also gated",
+              result2.get("title") == "(no audible speech)" and not llm_called[0])
+        # Real transcript still goes through
+        llm_called[0] = False
+        result3 = _m.Muesli().summarize("This is a real transcript with enough content to be summarised.")
+        check("summarize(real transcript) DOES call LLM",
+              llm_called[0])
+    finally:
+        _m._llm_generate = real_llm
+finally:
+    shutil.rmtree(_silent_dir, ignore_errors=True)
+
+
 # ── 17n. Lazy transcript load — idle GUI doesn't burn CPU ───────────────────
 # Without this, the auto-shown latest session pushed its full transcript
 # (200KB+ for a 7.7-hour recording) into the wrap=word Text widget at

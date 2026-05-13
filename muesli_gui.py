@@ -1613,6 +1613,18 @@ def _summarize_long_transcript_via_map_reduce(transcript, ollama_timeout=None):
 
 def _generate_ai_fields(transcript, ollama_timeout=None):
     text = transcript or ""
+    # Empty-transcript guard — see Muesli.summarize. The LLM hallucinates
+    # complete fake meetings from empty input (live repro 2026-05-13:
+    # silent recording -> "API Development Update" + 5-sentence fake
+    # summary). Hard gate at 12 chars.
+    if len(text.strip()) < 12:
+        return {
+            "title": "(no audible speech)",
+            "summary": "",
+            "speakers": 0,
+            "corrections": "",
+            "bugs": "",
+        }
     if len(text) > LONG_TRANSCRIPT_THRESHOLD_CHARS:
         # Map-reduce: condense long transcripts into per-window briefs first so
         # the final summary prompt sees a balanced view of the conversation
@@ -2528,6 +2540,22 @@ def process_recording(meta, on_update, transcript=None, summaries=None):
     mp3_path = os.path.join(SHARED_DIR, slug + ".mp3")
     wav_dest = os.path.join(SHARED_DIR, slug + ".wav")
 
+    # Silence gate, layer 1: measured BEFORE ffmpeg converts WAV to MP3 +
+    # deletes the WAV. _audio_rms only handles WAV (lazy reason: pure
+    # stdlib, no MP3 decoder dep). Doing it early also skips the ffmpeg
+    # conversion + whisper inference + LLM call entirely for silent
+    # recordings.
+    if transcript is None and os.path.exists(wav_path):
+        try:
+            from muesli import _audio_rms, SILENCE_RMS_THRESHOLD_DEFAULT
+            rms = _audio_rms(wav_path)
+            cfg_threshold = float(load_config().get("silence_rms_threshold")
+                                  or SILENCE_RMS_THRESHOLD_DEFAULT)
+            if rms < cfg_threshold:
+                transcript = ""  # short-circuits whisper + LLM below
+        except Exception:
+            pass
+
     # Check if source file is large (> 1 MB) for progress reporting
     source_size = _file_size_mb(wav_path)
     large_file  = source_size > 1.0
@@ -2598,20 +2626,34 @@ def process_recording(meta, on_update, transcript=None, summaries=None):
     on_update(meta, "summarising…")
     llm_used = False
     active_summary_mode = get_summary_mode()
-    try:
-        if summaries and any(summaries):
-            # Merge chunk summaries (short input — fast)
-            merged = "\n".join(f"- {s}" for s in summaries if s)
-            prompt_text = active_summary_mode["prompt"].replace(
-                "{transcript}",
-                f"[Chunk summaries from a longer recording]\n{merged}")
-        else:
-            # Full transcript (fallback for non-chunked recordings)
-            prompt_text = active_summary_mode["prompt"].replace("{transcript}", transcript)
-        ai = _parse_ai_response(_llm_generate(prompt_text))
-        llm_used = True
-    except Exception:
-        ai = _fallback_ai_fields(transcript)
+    # Silence gate, layer 2: skip the LLM entirely for empty / trivial
+    # transcripts. Whisper hallucinations on near-silent input often emit
+    # short canned phrases ("Thank you.", "Bye.") that the LLM will then
+    # spin into a fake meeting. 12-char gate matches Muesli.summarize.
+    has_chunk_summaries = bool(summaries and any(summaries))
+    if not has_chunk_summaries and len((transcript or "").strip()) < 12:
+        ai = {
+            "title": "(no audible speech)",
+            "summary": "",
+            "speakers": 0,
+            "corrections": "",
+            "bugs": "",
+        }
+    else:
+        try:
+            if has_chunk_summaries:
+                # Merge chunk summaries (short input — fast)
+                merged = "\n".join(f"- {s}" for s in summaries if s)
+                prompt_text = active_summary_mode["prompt"].replace(
+                    "{transcript}",
+                    f"[Chunk summaries from a longer recording]\n{merged}")
+            else:
+                # Full transcript (fallback for non-chunked recordings)
+                prompt_text = active_summary_mode["prompt"].replace("{transcript}", transcript)
+            ai = _parse_ai_response(_llm_generate(prompt_text))
+            llm_used = True
+        except Exception:
+            ai = _fallback_ai_fields(transcript)
 
     default_title = default_session_title(meta.get("started_at", ""))
     title       = ai.get("title", "").strip() or default_title
