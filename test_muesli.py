@@ -1211,6 +1211,16 @@ check("MCP exposes resume_processing tool",
 check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_source)
 
+# 17m. Hotkey launcher uses pythonw.exe (no CLI window flash on boot).
+hotkey_launcher_source = open(os.path.join(REPO_DIR, "muesli_hotkey_launcher.vbs"),
+                              encoding="utf-8").read()
+check("hotkey launcher prefers pythonw.exe over python.exe",
+      'pythonwExe = venvRoot & "\\Scripts\\pythonw.exe"' in hotkey_launcher_source
+      and 'If fso.FileExists(pythonwExe) Then' in hotkey_launcher_source
+      and 'selectedPython = pythonwExe' in hotkey_launcher_source
+      and 'Chr(34) & selectedPython & Chr(34)' in hotkey_launcher_source)
+
+
 # 17l. Recorder lazy-inits PyAudio so Recorder() doesn't block the Tk main
 #      thread on a 5-15s PortAudio enumeration at GUI startup.
 recorder_block_start = gui_source.find("class Recorder:")

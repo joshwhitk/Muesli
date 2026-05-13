@@ -196,6 +196,21 @@ check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_src)
 
 
+# ── 17m. Hotkey launcher prefers pythonw (no CLI window flash at boot) ─────
+print("\n[17m] Hotkey launcher prefers pythonw.exe over python.exe")
+hotkey_launcher_src = open(os.path.join(REPO_DIR, "muesli_hotkey_launcher.vbs"),
+                           encoding="utf-8").read()
+check("hotkey launcher defines both pythonExe and pythonwExe paths",
+      'pythonExe = venvRoot & "\\Scripts\\python.exe"' in hotkey_launcher_src
+      and 'pythonwExe = venvRoot & "\\Scripts\\pythonw.exe"' in hotkey_launcher_src)
+check("hotkey launcher upgrades selectedPython to pythonwExe when present",
+      'selectedPython = pythonExe' in hotkey_launcher_src
+      and 'If fso.FileExists(pythonwExe) Then' in hotkey_launcher_src
+      and 'selectedPython = pythonwExe' in hotkey_launcher_src)
+check("hotkey launcher invokes selectedPython, not raw pythonExe",
+      'Chr(34) & selectedPython & Chr(34)' in hotkey_launcher_src)
+
+
 # ── 17l. Recorder lazy-inits PyAudio ────────────────────────────────────────
 # Without this, Recorder.__init__ called pyaudio.PyAudio() synchronously on
 # the Tk main thread at MuesliApp init time — PortAudio enumeration on
