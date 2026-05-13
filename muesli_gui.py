@@ -4525,7 +4525,19 @@ class MuesliApp(tk.Tk):
 
     def _start_recording(self):
         if not self._recording_available:
-            messagebox.showerror("Recording unavailable", "PyAudio is not installed, so microphone recording is disabled on this PC.")
+            # The check is `(pyaudio is not None) or (sd is not None)`, so this
+            # only fires when BOTH backends failed to import. The old wording
+            # blamed pyaudio specifically and confused users who had the
+            # sounddevice fallback installed but were still hitting some
+            # other startup failure.
+            messagebox.showerror(
+                "Recording unavailable",
+                "No audio backend is available. Install one of:\n"
+                "  .venv\\Scripts\\pip install sounddevice\n"
+                "  .venv\\Scripts\\pip install pyaudio\n"
+                "Either is sufficient; sounddevice is the easier install on "
+                "Windows.",
+            )
             return
         self._player.stop()
         self._live_transcript = ""
