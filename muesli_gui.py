@@ -2602,7 +2602,15 @@ class Recorder:
         if pyaudio is None and sd is None:
             raise RuntimeError("No recording backend is installed on this PC.")
         self._backend   = "pyaudio" if pyaudio is not None else "sounddevice"
-        self._pa        = pyaudio.PyAudio() if self._backend == "pyaudio" else None
+        # PyAudio() ctor enumerates every Windows audio device through PortAudio
+        # — measured 5-15s on this PC and can hang indefinitely if a driver
+        # misbehaves. Recorder() runs on the Tk main thread at startup, so
+        # doing it here freezes the GUI on launch (taskbar spinner, Responding
+        # =False, click-stalls — repro'd 2026-05-12 right after `pip install
+        # pyaudio`). Defer until first start() instead. Sounddevice doesn't
+        # have this problem because its PortAudio init is per-stream, not
+        # per-instance.
+        self._pa        = None
         self._stream    = None
         self._frames    = []
         self._thread    = None
@@ -2628,6 +2636,11 @@ class Recorder:
         self._sd_chunk_frames = []
         selected_device = _resolve_audio_input_device(self._backend)
         if self._backend == "pyaudio":
+            # Lazy init: see Recorder.__init__ comment. First start() pays the
+            # PortAudio enumeration cost (5-15s on Windows). All subsequent
+            # start() calls reuse the same _pa instance and are instant.
+            if self._pa is None:
+                self._pa = pyaudio.PyAudio()
             self._sample_width = self._pa.get_sample_size(FORMAT)
             open_kwargs = dict(
                 format=FORMAT,
@@ -3707,8 +3720,24 @@ class MuesliApp(tk.Tk):
                 self._interrupted.append(meta)
 
     def _startup_background(self):
-        """Single background thread: resume interrupted recordings.
-        LLM is no longer preloaded — Claude API is preferred (fast), local LLM is fallback only."""
+        """Single background thread: warm the audio backend + resume interrupted
+        recordings. LLM is no longer preloaded — Claude API is preferred (fast),
+        local LLM is fallback only."""
+        # Warm pyaudio.PyAudio() so the first recording start() doesn't block
+        # the main thread for 5-15s while PortAudio enumerates devices. The
+        # warm result is stashed on the existing recorder; if start() races
+        # ahead and finds _pa is None, it'll do its own (blocking) init —
+        # that's the worst case, only hit when --record fires before this
+        # warm thread completes (~3-5s after window appears).
+        if self._recorder is not None and self._recorder._backend == "pyaudio" and self._recorder._pa is None:
+            try:
+                self._recorder._pa = pyaudio.PyAudio()
+            except Exception:
+                # If PortAudio init fails on the warm thread, leave _pa as None
+                # so start() can retry on the main thread and surface any error
+                # via the normal recorder-failed UI path.
+                pass
+
         # Resume interrupted recordings
         if not self._interrupted:
             self.after(0, self._publish_runtime_state)

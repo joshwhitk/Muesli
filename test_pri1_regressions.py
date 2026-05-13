@@ -196,6 +196,34 @@ check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_src)
 
 
+# ── 17l. Recorder lazy-inits PyAudio ────────────────────────────────────────
+# Without this, Recorder.__init__ called pyaudio.PyAudio() synchronously on
+# the Tk main thread at MuesliApp init time — PortAudio enumeration on
+# Windows takes 5-15s and can hang on a misbehaving driver, freezing the
+# whole GUI on launch. Repro'd 2026-05-12 right after `pip install pyaudio`.
+print("\n[17l] Recorder lazy-inits PyAudio (no main-thread block on launch)")
+recorder_block_start = gui_src.find("class Recorder:")
+recorder_block_end = gui_src.find("\nclass ", recorder_block_start + 1)
+recorder_block = gui_src[recorder_block_start:recorder_block_end]
+init_block_start = recorder_block.find("def __init__")
+init_block_end = recorder_block.find("\n    def ", init_block_start + 1)
+init_block = recorder_block[init_block_start:init_block_end]
+check("Recorder.__init__ does NOT call pyaudio.PyAudio() (lazy init)",
+      "pyaudio.PyAudio()" not in init_block,
+      detail=init_block[:300])
+check("Recorder.__init__ leaves self._pa = None for lazy population",
+      "self._pa        = None" in init_block or "self._pa = None" in init_block)
+start_block_start = recorder_block.find("def start(")
+start_block_end = recorder_block.find("\n    def ", start_block_start + 1)
+start_block = recorder_block[start_block_start:start_block_end]
+check("Recorder.start() lazy-inits self._pa on first use",
+      "if self._pa is None:" in start_block
+      and "self._pa = pyaudio.PyAudio()" in start_block)
+check("_startup_background warms PyAudio on a daemon thread",
+      "self._recorder._pa = pyaudio.PyAudio()" in gui_src
+      and "def _startup_background" in gui_src)
+
+
 # ── 17k. _effective_summary_runtime is cached ───────────────────────────────
 # Without caching, the 1s _poll_runtime_state tick blocks the main thread on
 # `_selected_ollama_model() -> _list_ollama_models() -> /api/tags` (3+ seconds

@@ -1211,6 +1211,23 @@ check("MCP exposes resume_processing tool",
 check("MCP exposes processing_status tool",
       'name="processing_status"' in mcp_source)
 
+# 17l. Recorder lazy-inits PyAudio so Recorder() doesn't block the Tk main
+#      thread on a 5-15s PortAudio enumeration at GUI startup.
+recorder_block_start = gui_source.find("class Recorder:")
+recorder_block_end = gui_source.find("\nclass ", recorder_block_start + 1)
+recorder_block_src = gui_source[recorder_block_start:recorder_block_end]
+init_src = recorder_block_src[recorder_block_src.find("def __init__"):
+                              recorder_block_src.find("\n    def ", recorder_block_src.find("def __init__") + 1)]
+start_src = recorder_block_src[recorder_block_src.find("def start("):
+                               recorder_block_src.find("\n    def ", recorder_block_src.find("def start(") + 1)]
+check("Recorder.__init__ no longer calls pyaudio.PyAudio() (lazy)",
+      "pyaudio.PyAudio()" not in init_src)
+check("Recorder.start() lazy-inits self._pa on first use",
+      "if self._pa is None:" in start_src and "self._pa = pyaudio.PyAudio()" in start_src)
+check("_startup_background warms PyAudio off the main thread",
+      "self._recorder._pa = pyaudio.PyAudio()" in gui_source)
+
+
 # 17k. _effective_summary_runtime cache — prevents the 1s poll loop from
 #      blocking the main thread on a 3s ollama /api/tags call.
 check("TTL constant + cache slot defined",
