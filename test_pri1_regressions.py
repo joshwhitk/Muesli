@@ -259,6 +259,30 @@ check("_effective_summary_runtime returns the cached tuple on TTL hit",
       "(now - cache[0]) < self._EFFECTIVE_SUMMARY_RUNTIME_TTL_S" in gui_src)
 
 
+# ── 17n. Lazy transcript load — idle GUI doesn't burn CPU ───────────────────
+# Without this, the auto-shown latest session pushed its full transcript
+# (200KB+ for a 7.7-hour recording) into the wrap=word Text widget at
+# startup, and Tk's continuous layout recomputation pinned 1 CPU core
+# forever. Bisection 2026-05-13: see bugs.md "idle GUI burns ~1 CPU core".
+print("\n[17n] Lazy transcript load")
+detail_block_start = gui_src.find("class DetailPanel(tk.Frame):")
+detail_block_end = gui_src.find("\nclass ", detail_block_start + 1)
+detail_block = gui_src[detail_block_start:detail_block_end]
+check("DetailPanel.show always defaults to summary view (was 'transcript' if summary empty)",
+      'self._set_content_view("summary")' in detail_block
+      and 'self._set_content_view("summary" if body.strip() else "transcript")' not in detail_block)
+check("show() stashes transcript text into _pending_transcript_text instead of widget",
+      "self._pending_transcript_text = transcript_text" in detail_block
+      and 'self._set_text(self._transcript_txt, "")' in detail_block)
+check("_flush_pending_transcript helper defined",
+      "def _flush_pending_transcript" in detail_block)
+check("_refresh_content_view flushes the lazy transcript on tab activation",
+      "self._flush_pending_transcript()" in detail_block
+      and "self._content_view ==" in detail_block)
+check("DetailPanel.__init__ initialises _pending_transcript_text",
+      "self._pending_transcript_text = None" in detail_block)
+
+
 # ── 17j. SECURITY: slug + media-path validation ─────────────────────────────
 print("\n[17j] SECURITY: slug + media-path validation")
 import muesli_service

@@ -77,6 +77,12 @@ GRACE_SECONDS = 5.0            # window appeared; legitimate startup work
 SAMPLE_SECONDS = 10.0          # how long to keep probing
 SAMPLE_INTERVAL_S = 0.2        # 5 samples / second
 RESPONSE_TIMEOUT_MS = 100      # the actual responsiveness budget
+MAX_IDLE_CPU_PER_SECOND = 0.3  # idle GUI must use <30% of one core. Measured
+                               # 0.01 after the 2026-05-13 lazy-transcript fix;
+                               # was 0.99 before. 0.3 leaves headroom for slow
+                               # machines / occasional Tk redraw without
+                               # tolerating a regression of the wrap=word
+                               # layout-loop bug.
 
 # ── Win32 plumbing ───────────────────────────────────────────────────────────
 WM_NULL = 0x0000
@@ -340,6 +346,37 @@ def main():
         if bad > 0:
             failures.append(f"{bad} responsiveness samples exceeded the "
                             f"{RESPONSE_TIMEOUT_MS}ms cap")
+
+        # ── Idle CPU check ──────────────────────────────────────────────────
+        # Catches the 2026-05-13 wrap=word layout-loop regression where the
+        # GUI burned 1 CPU core forever even when nothing was happening.
+        # Sample CPU time over 8s; rate must be under MAX_IDLE_CPU_PER_SECOND.
+        print(f"\nMeasuring idle CPU rate for 8s...")
+        try:
+            cpu_sample = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; "
+                 f"if (-not $p) {{ Write-Output 'GONE'; exit }} "
+                 f"$c1 = $p.CPU; Start-Sleep -Seconds 8; $p.Refresh(); "
+                 f"$c2 = $p.CPU; "
+                 f"Write-Output ([math]::Round(($c2 - $c1) / 8, 2))"],
+                text=True, timeout=15,
+            ).strip()
+            try:
+                cpu_rate = float(cpu_sample)
+            except ValueError:
+                cpu_rate = -1.0
+        except (OSError, subprocess.SubprocessError):
+            cpu_rate = -1.0
+        print(f"  idle CPU rate:                {cpu_rate:.2f}/s "
+              f"(cap {MAX_IDLE_CPU_PER_SECOND:.2f}/s)")
+        if cpu_rate < 0:
+            failures.append("could not measure idle CPU rate (powershell failed)")
+        elif cpu_rate > MAX_IDLE_CPU_PER_SECOND:
+            failures.append(
+                f"idle CPU rate {cpu_rate:.2f}/s > cap {MAX_IDLE_CPU_PER_SECOND:.2f}/s "
+                "— likely a Tk widget layout-loop regression"
+            )
 
         if not failures:
             print("\nPASS — startup clean, GUI responsive")

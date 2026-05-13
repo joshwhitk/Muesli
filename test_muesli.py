@@ -1221,6 +1221,21 @@ check("hotkey launcher prefers pythonw.exe over python.exe",
       and 'Chr(34) & selectedPython & Chr(34)' in hotkey_launcher_source)
 
 
+# 17n. Lazy transcript load — idle GUI doesn't burn CPU.
+detail_class_start = gui_source.find("class DetailPanel(tk.Frame):")
+detail_class_end = gui_source.find("\nclass ", detail_class_start + 1)
+detail_block_src = gui_source[detail_class_start:detail_class_end]
+check("DetailPanel.show always defaults to summary view",
+      'self._set_content_view("summary")' in detail_block_src
+      and 'self._set_content_view("summary" if body.strip() else "transcript")' not in detail_block_src)
+check("show() stashes transcript text instead of inserting eagerly",
+      "self._pending_transcript_text = transcript_text" in detail_block_src
+      and 'self._set_text(self._transcript_txt, "")' in detail_block_src)
+check("_flush_pending_transcript helper defined + wired in _refresh_content_view",
+      "def _flush_pending_transcript" in detail_block_src
+      and "self._flush_pending_transcript()" in detail_block_src)
+
+
 # 17l. Recorder lazy-inits PyAudio so Recorder() doesn't block the Tk main
 #      thread on a 5-15s PortAudio enumeration at GUI startup.
 recorder_block_start = gui_source.find("class Recorder:")

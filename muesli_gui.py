@@ -27,6 +27,79 @@ import uuid
 import pygame
 from muesli_runtime import load_runtime_state, update_runtime_state
 
+
+# ── DEBUG: per-after() instrumentation ───────────────────────────────────────
+# Activated by env var MUESLI_DEBUG_AFTER=1 (default off — zero cost in
+# production). Monkey-patches tk.Misc.after to count call rates by callable
+# and dumps to %LOCALAPPDATA%\muesli\after_stats.log every 5s. Used to
+# bisect the 2026-05-13 idle CPU burn in `Tcl_DeleteTimerHandler` /
+# TkBTreeNumLines hot path. See bugs.md "idle GUI burns ~1 CPU core".
+if os.environ.get("MUESLI_DEBUG_AFTER") == "1":
+    import threading as _threading_dbg
+    _after_counter_lock = _threading_dbg.Lock()
+    _after_counter = {"total": 0, "by_caller": {}}
+    _after_stats_started = [False]
+    _orig_after = tk.Misc.after
+    def _counted_after(self, ms, *args, **kwargs):
+        try:
+            with _after_counter_lock:
+                _after_counter["total"] += 1
+                if args and callable(args[0]):
+                    name = getattr(args[0], "__qualname__", None) or repr(args[0])[:80]
+                else:
+                    name = f"<no-callable ms={ms}>"
+                key = f"{name}@{ms}ms"
+                _after_counter["by_caller"][key] = _after_counter["by_caller"].get(key, 0) + 1
+        except Exception:
+            pass
+        return _orig_after(self, ms, *args, **kwargs)
+    tk.Misc.after = _counted_after
+
+    def _start_after_stats_dumper(root):
+        if _after_stats_started[0]:
+            return
+        _after_stats_started[0] = True
+        local_app = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        log_path = os.path.join(local_app, "muesli", "after_stats.log")
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        except OSError:
+            pass
+        last = {"total": 0, "snapshot_at": time.monotonic()}
+        def _dump():
+            try:
+                with _after_counter_lock:
+                    total = _after_counter["total"]
+                    by_caller = dict(_after_counter["by_caller"])
+                    _after_counter["by_caller"] = {}  # reset per-window
+                now = time.monotonic()
+                window = max(0.001, now - last["snapshot_at"])
+                delta = total - last["total"]
+                rate = delta / window
+                last["total"] = total
+                last["snapshot_at"] = now
+                # Try to query Tcl's active timer queue length.
+                try:
+                    pending = root.tk.call("after", "info")
+                    pending_count = len(str(pending).split()) if pending else 0
+                except Exception:
+                    pending_count = -1
+                top = sorted(by_caller.items(), key=lambda x: -x[1])[:10]
+                line = (
+                    f"{datetime.datetime.now().isoformat(timespec='milliseconds')}\t"
+                    f"after_calls/s={rate:.1f}\ttotal={total}\tpending_timers={pending_count}\t"
+                    f"top10={top}\n"
+                )
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception:
+                pass
+            finally:
+                root.after(5000, _dump)
+        root.after(5000, _dump)
+    print(f"[MUESLI_DEBUG_AFTER] instrumentation active; stats every 5s to "
+          f"%LOCALAPPDATA%\\muesli\\after_stats.log", flush=True)
+
 try:
     from faster_whisper import WhisperModel
 except ImportError:
@@ -5078,6 +5151,9 @@ class DetailPanel(tk.Frame):
         self._title_manual = False
         self._summary_manual = False
         self._content_view = "summary"
+        # Stash for lazy transcript-widget population; flushed by
+        # _flush_pending_transcript on transcript-tab activation.
+        self._pending_transcript_text = None
         self._process_nodes = {
             "audio": "pending",
             "chunks": "pending",
@@ -5531,9 +5607,30 @@ class DetailPanel(tk.Frame):
             )
         else:
             self._flow_note_var.set("Review the final transcript, then adjust the summary if needed.")
-            self._set_text(self._transcript_txt, transcript_text)
-            self._set_content_view("summary" if body.strip() else "transcript")
+            # Lazy-load transcript text into the widget. Only flushed by
+            # _refresh_content_view when the user activates the Transcript
+            # tab. Avoids the wrap=word layout cost for sessions the user
+            # never opens the transcript of.
+            self._pending_transcript_text = transcript_text
+            self._set_text(self._transcript_txt, "")
+            # Always default to summary view (even when summary is empty
+            # we'd previously switch to transcript, which defeats the
+            # lazy load and burns one CPU core continuously while Tk
+            # word-wraps a long transcript). User clicks the Transcript
+            # tab when they actually want it. Empty summary just shows
+            # the empty widget — fine, no layout work.
+            self._set_content_view("summary")
         self._sync_process_diagram(meta)
+
+    def _flush_pending_transcript(self):
+        """Push the stashed transcript text into the widget. Idempotent —
+        clears `_pending_transcript_text` after the first flush so re-opening
+        the transcript tab doesn't re-render."""
+        pending = getattr(self, "_pending_transcript_text", None)
+        if pending is None:
+            return
+        self._pending_transcript_text = None
+        self._set_text(self._transcript_txt, pending)
 
     # ── Transport ─────────────────────────────────────────────────────────────
     def _on_play(self):
@@ -5628,7 +5725,18 @@ class DetailPanel(tk.Frame):
             )
 
     def _set_content_view(self, view):
-        self._content_view = "transcript" if view == "transcript" else "summary"
+        desired = "transcript" if view == "transcript" else "summary"
+        # No-op when the view hasn't changed. The pack_forget + pack churn
+        # in _refresh_content_view triggers Tk geometry events that can
+        # cascade into a feedback loop with the listbox <Configure>
+        # binding, the PanedWindow geometry manager, and the Text widget's
+        # wrap=word layout — empirically pinning one CPU core forever.
+        # Bisection 2026-05-13 traced the residual idle burn to show()
+        # always re-calling _set_content_view with the same value
+        # (summary), forcing redundant pack churn each time.
+        if desired == self._content_view and hasattr(self, "_summary_panel"):
+            return
+        self._content_view = desired
         self._refresh_content_view()
 
     def _refresh_content_view(self):
@@ -5637,6 +5745,10 @@ class DetailPanel(tk.Frame):
         for panel in (self._summary_panel, self._transcript_panel):
             panel.pack_forget()
         if self._content_view == "transcript":
+            # Flush the lazy-stashed transcript text into the widget on
+            # tab activation. Avoids paying the wrap=word layout cost
+            # for sessions the user never views the transcript of.
+            self._flush_pending_transcript()
             self._transcript_panel.pack(fill="both", expand=True)
             self._summary_tab_btn.configure_button(bg=ITEM_BG, fg=FG_DIM)
             self._transcript_tab_btn.configure_button(bg=PANEL_BG, fg=FG)
@@ -5659,6 +5771,7 @@ class DetailPanel(tk.Frame):
         self._title_manual = False
         self._summary_manual = False
         self._content_view = "summary"
+        self._pending_transcript_text = None
         self._stop_tick()
         self._edit_summary_btn.set_enabled(False)
         self._content.pack_forget()
@@ -5880,6 +5993,12 @@ if __name__ == "__main__":
         app = MuesliApp(launch_token=launch_token, launch_probe=launch_probe)
         if IS_WIN:
             app.after(200, ensure_shared_dir_configured)
+        # Activate after()-call instrumentation if env var is set (debug only).
+        if os.environ.get("MUESLI_DEBUG_AFTER") == "1":
+            try:
+                _start_after_stats_dumper(app)
+            except NameError:
+                pass
         app.mainloop()
     finally:
         _finish_launch_status(launch_token)
