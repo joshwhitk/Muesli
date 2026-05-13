@@ -68,11 +68,15 @@ WSCRIPT = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                       "System32", "wscript.exe")
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
-MAX_LAUNCH_SECONDS = 120.0   # cold pygame + faster_whisper + ctranslate2
-GRACE_SECONDS = 5.0          # window appeared; legitimate startup work
-SAMPLE_SECONDS = 10.0        # how long to keep probing
-SAMPLE_INTERVAL_S = 0.2      # 5 samples / second
-RESPONSE_TIMEOUT_MS = 100    # the actual responsiveness budget
+MAX_LAUNCH_SECONDS = 30.0      # hard fail if window doesn't appear in this
+                               # window — measured 6.2s on this PC after the
+                               # 2026-05-12 lazy-pyaudio fix; 30s gives slack
+                               # for slower machines without forgiving wedges
+WARN_LAUNCH_SECONDS = 15.0     # printed warning above this, still passes
+GRACE_SECONDS = 5.0            # window appeared; legitimate startup work
+SAMPLE_SECONDS = 10.0          # how long to keep probing
+SAMPLE_INTERVAL_S = 0.2        # 5 samples / second
+RESPONSE_TIMEOUT_MS = 100      # the actual responsiveness budget
 
 # ── Win32 plumbing ───────────────────────────────────────────────────────────
 WM_NULL = 0x0000
@@ -113,6 +117,83 @@ def _process_image_name(pid):
         if line.startswith("Name="):
             return line.split("=", 1)[1].strip().lower()
     return ""
+
+
+_MUESLI_RUNTIME_SCRIPTS = (
+    "muesli_gui_bootstrap.py", "muesli_gui.py",
+    "muesli_hotkey.py",
+    "muesli_service.py", "muesli_mcp.py",
+)
+
+
+def _muesli_processes():
+    """List (pid, image_name, command_line) for every running python that's
+    executing a Muesli RUNTIME script (gui bootstrap, hotkey sidecar, service,
+    mcp). Excludes test scripts and the test runner itself. Used to assert
+    no console-attached python.exe is in the picture (would be a CLI window
+    flash regression)."""
+    try:
+        out = subprocess.check_output(
+            ["wmic", "process", "get", "ProcessId,Name,CommandLine", "/format:csv"],
+            stderr=subprocess.DEVNULL, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    self_pid = os.getpid()
+    rows = []
+    for line in out.splitlines():
+        if not line or line.startswith("Node,"):
+            continue
+        parts = line.split(",")
+        # csv format: Node,CommandLine,Name,ProcessId — but CommandLine itself
+        # often contains commas, so parse defensively from the right.
+        try:
+            pid = int(parts[-1].strip())
+            name = parts[-2].strip().lower()
+        except (IndexError, ValueError):
+            continue
+        if pid == self_pid:
+            continue
+        if name not in ("python.exe", "pythonw.exe"):
+            continue
+        cmdline = ",".join(parts[1:-2])
+        cmd_lower = cmdline.lower()
+        # Only flag actual muesli runtime processes, not test scripts.
+        if not any(script in cmd_lower for script in _MUESLI_RUNTIME_SCRIPTS):
+            continue
+        rows.append((pid, name, cmdline))
+    return rows
+
+
+def _console_windows_owned_by_pids(pids):
+    """Find any visible 'ConsoleWindowClass' top-level windows owned by the
+    given pids. A non-empty result is a CLI-window-flash regression."""
+    pid_set = set(int(p) for p in pids)
+    if not pid_set:
+        return []
+    found = []
+    user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+
+    def cb(hwnd, _l):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        owner_pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        if int(owner_pid.value) not in pid_set:
+            return True
+        cls_buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls_buf, 256)
+        cls = cls_buf.value
+        if cls in ("ConsoleWindowClass", "PseudoConsoleWindow", "Windows.UI.Core.CoreWindow"):
+            title_len = user32.GetWindowTextLengthW(hwnd)
+            t_buf = ctypes.create_unicode_buffer(title_len + 1)
+            user32.GetWindowTextW(hwnd, t_buf, title_len + 1)
+            found.append((hwnd, int(owner_pid.value), cls, t_buf.value))
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(cb), 0)
+    return found
 
 
 def find_muesli_window():
@@ -189,11 +270,44 @@ def main():
         print(f"FAIL: window did not appear within {MAX_LAUNCH_SECONDS}s")
         return 1
     hwnd, pid, title = win
-    print(f"Window appeared after {time.monotonic() - launch_start:.1f}s: "
+    launch_secs = time.monotonic() - launch_start
+    print(f"Window appeared after {launch_secs:.1f}s: "
           f"hwnd={hwnd} pid={pid} title={title!r}")
+    if launch_secs > WARN_LAUNCH_SECONDS:
+        print(f"  WARN: launch was slow ({launch_secs:.1f}s > {WARN_LAUNCH_SECONDS:.0f}s).")
+
+    failures = []
+
+    # ── Clean-startup checks ─────────────────────────────────────────────────
+    print("\nChecking for clean startup (no CLI windows, no stray python.exe):")
+    muesli_procs = _muesli_processes()
+    print(f"  muesli processes: {len(muesli_procs)} found")
+    for p_pid, p_name, p_cmd in muesli_procs:
+        head = p_cmd[:120] + ("..." if len(p_cmd) > 120 else "")
+        print(f"    pid={p_pid} name={p_name} cmd={head}")
+    # Any python.exe (vs pythonw.exe) running a muesli script means a CLI
+    # window can flash on launch — the bug fixed for the hotkey launcher
+    # 2026-05-13. Both GUI bootstrap and hotkey sidecar should be pythonw.
+    cli_pythons = [(p, n, c) for p, n, c in muesli_procs if n == "python.exe"]
+    if cli_pythons:
+        failures.append(f"{len(cli_pythons)} muesli process(es) running on python.exe (console-attached) "
+                        "instead of pythonw.exe — would flash a CLI window:")
+        for p_pid, _, p_cmd in cli_pythons:
+            head = p_cmd[:120] + ("..." if len(p_cmd) > 120 else "")
+            failures.append(f"  pid={p_pid} cmd={head}")
+    else:
+        print("  no console-attached python.exe — clean")
+
+    console_windows = _console_windows_owned_by_pids([p for p, _, _ in muesli_procs])
+    if console_windows:
+        failures.append(f"{len(console_windows)} console window(s) owned by muesli pids:")
+        for w_hwnd, w_pid, w_cls, w_title in console_windows:
+            failures.append(f"  hwnd={w_hwnd} pid={w_pid} class={w_cls} title={w_title!r}")
+    else:
+        print("  no ConsoleWindowClass windows owned by any muesli pid — clean")
 
     try:
-        print(f"Grace period: {GRACE_SECONDS}s")
+        print(f"\nGrace period: {GRACE_SECONDS}s")
         time.sleep(GRACE_SECONDS)
 
         print(f"Sampling for {SAMPLE_SECONDS}s:")
@@ -221,10 +335,19 @@ def main():
         print(f"Results: {ok}/{total} samples responded within {RESPONSE_TIMEOUT_MS}ms")
         print(f"  slowest sample (any):        {slowest_ms:.0f}ms")
         print(f"  slowest sample that passed:  {slowest_responsive_ms:.0f}ms")
-        if bad == 0:
-            print("PASS")
+        print(f"  launch time:                  {launch_secs:.1f}s "
+              f"(warn>{WARN_LAUNCH_SECONDS:.0f}s, fail>{MAX_LAUNCH_SECONDS:.0f}s)")
+        if bad > 0:
+            failures.append(f"{bad} responsiveness samples exceeded the "
+                            f"{RESPONSE_TIMEOUT_MS}ms cap")
+
+        if not failures:
+            print("\nPASS — startup clean, GUI responsive")
             return 0
-        print(f"FAIL: {bad} samples exceeded the {RESPONSE_TIMEOUT_MS}ms responsiveness cap")
+        print()
+        print(f"FAIL — {len(failures)} issue(s):")
+        for f in failures:
+            print(f"  {f}")
         return 1
     finally:
         print("Cleanup: PostMessage WM_CLOSE")
