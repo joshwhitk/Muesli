@@ -1,5 +1,13 @@
 # Muesli
 
+## Repository guide — 2026-09-27
+
+A local-first audio recording, transcription and summarization toolkit for Windows and Linux.
+
+- The current source includes a desktop GUI, batch processing, a persistent service and an MCP interface. MUESLI_API.md describes the service and agent-facing operations.
+- Local committed service and responsiveness improvements have been synchronized to GitHub. A separate uncommitted microphone-watcher experiment exists locally and is not part of that committed baseline.
+- The older comparison table below predates the service/MCP work; use MUESLI_API.md and the current source for integration support.
+
 Muesli is a local-first audio recorder, transcription app, and batch transcription tool.
 It is inspired by Granola's workflow, but it is not a full Granola clone.
 
